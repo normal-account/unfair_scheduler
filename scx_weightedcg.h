@@ -42,7 +42,7 @@ enum stat_idx {
 	STAT_NR,
 };
 
-#define CPU_MASK_BITS 256
+#define CPU_MASK_BITS 96
 #define MASK_WORDS    (CPU_MASK_BITS / 64)
 
 struct cgrp_ctx {
@@ -103,7 +103,7 @@ struct cgrp_stats {
 #endif
 
 #ifndef RT_VTIME
-#define RT_VTIME 1
+#define RT_VTIME 0
 #endif
 
 #ifndef RT_ACTIVE_CHECK
@@ -127,11 +127,11 @@ struct cgrp_stats {
 #endif
 
 #ifndef DUMP_TRACES
-#define DUMP_TRACES 0
+#define DUMP_TRACES 1
 #endif
 
 #if DEBUG
-#define log(fmt, rt_class, ...) if ( rt_class == 2 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif
