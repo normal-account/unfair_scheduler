@@ -106,7 +106,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef FCG_DEBUG
-#define FCG_DEBUG 0
+#define FCG_DEBUG 1
 #endif
 
 #ifndef FCG_BUDDIES
@@ -114,7 +114,7 @@ struct fcg_cgrp_stats {
 #endif
 
 #ifndef RT_VTIME
-#define RT_VTIME 0
+#define RT_VTIME 1
 #endif
 
 #ifndef RT_ACTIVE_CHECK

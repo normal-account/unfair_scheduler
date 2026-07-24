@@ -8,7 +8,7 @@ KVER=$(shell uname -r)
 # Strip distro-specific suffixes (e.g. -generic, -amd64) from kernel version
 BASVER=$(shell echo "$(KVER)" | sed -e 's/-.*//' -e 's/[[:space:]]//g')
 
-KERNEL_SRC_DIR := linux-$(BASVER)
+KERNEL_SRC_DIR := linux/src/linux-$(BASVER)
 
 # --- loader config ---
 CC      ?= cc
@@ -56,7 +56,7 @@ $(LOADER_NAME): $(SCHED_NAME).skel.h
 	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) \
 	  -I . \
 	  -I /usr/include/bpf \
-	  -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
+	   -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
 	  $(LOADER_NAME).c -o $(LOADER_NAME) $(LIBBPF_LIBS)
 
 # Start your scheduler via the loader (keeps the process alive)

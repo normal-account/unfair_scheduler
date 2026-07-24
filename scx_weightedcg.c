@@ -189,6 +189,11 @@ static int pin_postgres_rb(struct scx_weightedcg_bpf *skel)
         return err;
     }
 
+    if (chmod("/sys/fs/bpf", 0777) != 0) {
+        fprintf(stderr, "ERROR: chmod(%s, 0777) failed: %s\n", "/sys/fs/bpf", strerror(errno));
+		return errno;
+    }
+
     if (chmod(path, 0777) != 0) {
         fprintf(stderr, "ERROR: chmod(%s, 0777) failed: %s\n", path, strerror(errno));
 		return errno;

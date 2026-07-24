@@ -1,4 +1,36 @@
+/* Newer sched_ext compat wrappers reuse these names as static inlines. */
+#define scx_bpf_select_cpu_and __vmlinux_scx_bpf_select_cpu_and
+#define scx_bpf_dsq_insert __vmlinux_scx_bpf_dsq_insert
+#define scx_bpf_dsq_insert_vtime __vmlinux_scx_bpf_dsq_insert_vtime
+#define scx_bpf_task_set_slice __vmlinux_scx_bpf_task_set_slice
+#define scx_bpf_task_set_dsq_vtime __vmlinux_scx_bpf_task_set_dsq_vtime
+#define scx_bpf_reenqueue_local __vmlinux_scx_bpf_reenqueue_local
+#define scx_bpf_sub_dispatch __vmlinux_scx_bpf_sub_dispatch
+#define scx_bpf_dsq_reenq __vmlinux_scx_bpf_dsq_reenq
 #include "vmlinux.h"
+#undef scx_bpf_select_cpu_and
+#undef scx_bpf_dsq_insert
+#undef scx_bpf_dsq_insert_vtime
+#undef scx_bpf_task_set_slice
+#undef scx_bpf_task_set_dsq_vtime
+#undef scx_bpf_reenqueue_local
+#undef scx_bpf_sub_dispatch
+#undef scx_bpf_dsq_reenq
+
+// /* Some 6.19 BTF dumps expose the new kfuncs without these argument structs. */
+// struct scx_bpf_select_cpu_and_args {
+//     s32 prev_cpu;
+//     u64 wake_flags;
+//     u64 flags;
+// };
+
+// struct scx_bpf_dsq_insert_vtime_args {
+//     u64 dsq_id;
+//     u64 slice;
+//     u64 vtime;
+//     u64 enq_flags;
+// };
+
 #include <scx/common.bpf.h>
 #include "scx_weightedcg.h"
 /*
@@ -930,12 +962,28 @@ static long pg_rb_cb(const struct bpf_dynptr *dynptr, void *ctx)
         log("\tpg_rb_cb: pid %d released lock", 2, ev.pid);
     }
 
+    char* desc;
+    switch (ev.event_info) {
+        case 0x01000000U:
+            desc = "LWLOCK";
+            break;
+        case 0x03000000:
+            desc = "TABLE LOCK";
+            break;
+        case 0x09000006:
+            desc = "SPINLOCK";
+            break;
+        default:
+            desc = "UNKNOWN";
+            break;
+    }
+
     if (ev.is_start)
     {
-        log("\tpg_rb_cb: WAIT START %s pid=%d owner pid=%d type=%u lock=0x%x", 2, ev.event_info == 0x01000000U ? "LWLOCK" : "SPINLOCK", ev.pid, ev.owner_pid, ev.type, ev.lock);
+        log("\tpg_rb_cb: WAIT START %s pid=%d owner pid=%d type=%u lock=0x%x", 2, desc, ev.pid, ev.owner_pid, ev.type, ev.lock);
     }
     else{
-        log("\tpg_rb_cb: WAIT END %s pid=%d type=%u", 2, ev.event_info == 0x01000000U ? "LWLOCK" : "SPINLOCK", ev.pid, ev.type);
+        log("\tpg_rb_cb: WAIT END %s pid=%d type=%u", 2, desc, ev.pid, ev.type);
     }
 
 
@@ -1724,7 +1772,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
     struct cgroup *cgrp;
     struct fcg_cgrp_ctx *cgc;
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
     // IF this is the RT class
@@ -1773,7 +1821,7 @@ s32 BPF_STRUCT_OPS(fcg_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
                     s64 d = time_delta(now_v, tv);   // signed
                     is_behind = d > 0;//(s64)slack_v;
     
-                     log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+                     log("\tfcg_enqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc && cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
                 }
                 #endif
                 
@@ -2029,7 +2077,7 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
 
     // if (should_boost_task(p)) {
     //     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL,
@@ -2175,8 +2223,8 @@ void BPF_STRUCT_OPS(fcg_enqueue, struct task_struct *p, u64 enq_flags)
              * more control over when tasks with custom cpumask get issued.
              */
             //
-            if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
-            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
+            //if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
+            if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
             //if (false) {
                 stat_inc(FCG_STAT_LOCAL);
                 #if RT_ACTIVE_CHECK
@@ -2333,7 +2381,7 @@ void BPF_STRUCT_OPS(fcg_runnable, struct task_struct *p, u64 enq_flags)
     struct cgroup *cgrp;
     struct fcg_cgrp_ctx *cgc;
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
 #if FCG_DEBUG
@@ -2352,7 +2400,7 @@ void BPF_STRUCT_OPS(fcg_running, struct task_struct *p)
     struct fcg_cpu_ctx *cpuc;
 
     /* Update per-CPU current cgid immediately for selected CPU */
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
     u32 cpu = bpf_get_smp_processor_id();
@@ -2448,7 +2496,7 @@ void BPF_STRUCT_OPS(fcg_stopping, struct task_struct *p, bool runnable)
         goto log_and_out;
     }
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
     u64 cgid = cgrp ? cgrp->kn->id : 0;
@@ -2534,7 +2582,7 @@ void BPF_STRUCT_OPS(fcg_quiescent, struct task_struct *p, u64 deq_flags)
     struct fcg_cgrp_ctx *cgc;
     struct cgroup *cgrp;
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     update_active_weight_sums(cgrp, false);
 
     cgc = find_cgrp_ctx(cgrp);
@@ -2712,7 +2760,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     u64 enq_count =__sync_fetch_and_add(&cgc->enq_count, 0);
 
-    if (scx_bpf_dsq_move_to_local(cgid))
+    if (scx_bpf_dsq_move_to_local(cgid, 0))
     {
         if ( cpu < NR_CPUS_LOG ) log("\t\ttry_pick_next_cgroup: scx_bpf_dsq_move_to_local(%llu, %d) SUCCEEDED (is RT tree %d) (enq_count=%llu)", cgc->rt_class, cgid, cpu, &cgv_tree_rt == cgv_tree, enq_count);
 
@@ -2817,8 +2865,8 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 
     pg_rb_try_drain();
 
-    if ( cpu == 0 ) // TEMPORARY: REMOVE
-    {
+    log("\tfcg_dispatch: dispatch called on cpu %d", 2, cpu);
+
     #pragma clang loop unroll(full)
     for (u32 i = 0; i < FCG_MAX_PI_EVENTS; i++) {
         u32 key = i;
@@ -2840,19 +2888,35 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
                 continue;
             } 
 
-            const struct cpumask *allowed = (const struct cpumask *)owner_task->cpus_ptr;
-            if (!bpf_cpumask_test_cpu((s32)cpu, allowed)) {
+            struct fcg_task_ctx *o_ctx = bpf_task_storage_get(&task_ctx, owner_task, 0, 0);
+            if (!o_ctx) {
 
-                log("\tfcg_dispatch bypass: cancelling because cpuset for pid %u on cpu %d", 2, pid_to_pull, cpu);
+                log("\tfcg_dispatch bypass: cancelling because of NULL ctx for pid %u on cpu %d", 2, pid_to_pull, cpu);
 
                 bpf_task_release(owner_task);
                 continue;
             }
 
-            struct fcg_task_ctx *o_ctx = bpf_task_storage_get(&task_ctx, owner_task, 0, 0);
-            if (!o_ctx) {
+            const struct cpumask *allowed = (const struct cpumask *)owner_task->cpus_ptr;
+            u32 dst_cpu = cpu;
+            u64 dst_dsq = SCX_DSQ_LOCAL;
 
-                log("\tfcg_dispatch bypass: cancelling because of NULL ctx for pid %u on cpu %d", 2, pid_to_pull, cpu);
+            if (!bpf_cpumask_test_cpu((s32)dst_cpu, allowed)) {
+                dst_cpu = o_ctx->last_cpu;
+                if (dst_cpu >= nr_cpus ||
+                    !bpf_cpumask_test_cpu((s32)dst_cpu, allowed)) {
+                    log("\tfcg_dispatch bypass: cancelling because cpuset for pid %u on cpu %d (last_cpu=%u)", 2, pid_to_pull, cpu, dst_cpu);
+
+                    bpf_task_release(owner_task);
+                    continue;
+                }
+
+                dst_dsq = SCX_DSQ_LOCAL_ON | dst_cpu;
+            }
+
+            struct fcg_cpu_ctx *dstc = find_cpu_ctx(dst_cpu);
+            if (!dstc) {
+                log("\tfcg_dispatch bypass: cancelling because of NULL cpu ctx for pid %u on dst cpu %u", 2, pid_to_pull, dst_cpu);
 
                 bpf_task_release(owner_task);
                 continue;
@@ -2868,12 +2932,16 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
 
             // AFFINITY CHECK
             struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid_to_pull);
-            if (true ||st && st->init && fcg_mask_test_cpu(st, (u32)cpu)) { // TODO: Fix affinity check
+            if (true ||st && st->init && fcg_mask_test_cpu(st, dst_cpu)) { // TODO: Fix affinity check
                 struct bpf_iter_scx_dsq it;
                 struct task_struct *p;
+
+                u64 src_dsq = cgid_to_pull;
+                if (owner_task->nr_cpus_allowed != nr_cpus)
+                    src_dsq = FALLBACK_DSQ;
                 
                 // Open the DSQ Iterator for the specific cgroup
-                bpf_iter_scx_dsq_new(&it, cgid_to_pull, 0);
+                bpf_iter_scx_dsq_new(&it, src_dsq, 0);
                 
                 int steps = 0;
                 while ((p = bpf_iter_scx_dsq_next(&it))) {
@@ -2881,47 +2949,53 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
                     if (++steps > PI_SCAN_MAX)
                         break;
 
+                    log("\tfcg_dispatch bypass: iterating %u", 2, p->pid);
+
                     if (p->pid == pid_to_pull) {
-                        // Target acquired: Yank it to our local DSQ
-                        // Note: Named scx_bpf_dispatch_from_dsq() on kernel 6.12
-                        if ( scx_bpf_dsq_move(&it, p, SCX_DSQ_LOCAL, SCX_ENQ_PREEMPT) )
+
+                        log("\tfcg_dispatch bypass: found pid %u in the list of DSQs for cgid %llu", 2, pid_to_pull, cgid_to_pull);
+
+                        // Target acquired: Yank it to the selected CPU's local DSQ.
+                        if ( scx_bpf_dsq_move(&it, p, dst_dsq, SCX_ENQ_PREEMPT) )
                         {
                             // CLAIM IT: Atomically clear the slot
                             __sync_val_compare_and_swap(slot, pid_to_pull, 0);
                             
-                            pi_boost_inc(o_ctx, cpu, pid_to_pull);
-                            cnt_inc_pending(cpuc, cpu);
-                            cpuc->cur_bk_cgid = cgid_to_pull;
-                            cpuc->cur_bk_at = now;
+                            pi_boost_inc(o_ctx, dst_cpu, pid_to_pull);
+                            cnt_inc_pending(dstc, dst_cpu);
+                            dstc->cur_bk_cgid = cgid_to_pull;
+                            dstc->cur_bk_at = now;
                             pulled = true;
 
                             stat_inc(FCG_STAT_BPF_DP_BOOST);
 
-                            log("\tfcg_dispatch bypass: successfully BOOSTED pid %u on cpu %d", 2, pid_to_pull, cpu);
+                            if (dst_cpu != cpu)
+                                scx_bpf_kick_cpu(dst_cpu, SCX_KICK_PREEMPT);
+
+                            log("\tfcg_dispatch bypass: successfully BOOSTED pid %u on dst cpu %u from cpu %d", 2, pid_to_pull, dst_cpu, cpu);
 
                             break;                            
                         }
                         else 
                         {
-                            log("\tfcg_dispatch bypass: failed to move pid %u on cpu %d", 2, pid_to_pull, cpu);
+                            log("\tfcg_dispatch bypass: failed to move pid %u to dst cpu %u from cpu %d", 2, pid_to_pull, dst_cpu, cpu);
                         }
                     }
                 }
 
-                log("\tfcg_dispatch bypass: Finished scanning DSQ for pid %u on cpu %d (cgid %llu)", 2, pid_to_pull, cpu, cgid_to_pull);
+                log("\tfcg_dispatch bypass: Finished scanning DSQ for pid %u on cpu %d dst cpu %u (cgid %llu)", 2, pid_to_pull, cpu, dst_cpu, cgid_to_pull);
                 
                 bpf_iter_scx_dsq_destroy(&it);
             }
             else 
             {
-                log("\tfcg_dispatch bypass: cancelling bypass because of affinity for pid %u on cpu %d", 2, pid_to_pull, cpu);
+                log("\tfcg_dispatch bypass: cancelling bypass because of affinity for pid %u on dst cpu %u", 2, pid_to_pull, dst_cpu);
             }
 
             bpf_task_release(owner_task);
 
             if (pulled) return;
         }
-    }
     }
     // --- END BYPASS ---
 
@@ -2962,7 +3036,7 @@ void BPF_STRUCT_OPS(fcg_dispatch, s32 cpu, struct task_struct *prev)
             goto pick_next_cgroup;
         }
         
-        if (scx_bpf_dsq_move_to_local(cpuc->cur_bk_cgid)) {
+        if (scx_bpf_dsq_move_to_local(cpuc->cur_bk_cgid, 0)) {
             stat_inc(FCG_STAT_CNS_KEEP);
 
             log("\tfcg_dispatch: scx_bpf_dsq_move_to_local(%llu, %d) SUCCEEDED in KEEP path", 0, cpuc->cur_bk_cgid, cpu);
@@ -3037,7 +3111,7 @@ pick_next_cgroup:
 			cls = cpu_cls(cpu, 0);
 			if ( cls != CPU_RT )
 			{
-				if (scx_bpf_dsq_move_to_local(FALLBACK_DSQ)) {
+				if (scx_bpf_dsq_move_to_local(FALLBACK_DSQ, 0)) {
 					return;
 				}
 			}
@@ -3251,7 +3325,7 @@ void BPF_STRUCT_OPS(fcg_cgroup_move, struct task_struct *p,
     if ( cur_cpu >= nr_cpus )
         return;
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     if ( cgrp )
     {
         cgc = find_cgrp_ctx(cgrp);
@@ -3315,7 +3389,7 @@ void BPF_STRUCT_OPS(fcg_exit_task, struct task_struct *p, struct scx_exit_task_a
     struct fcg_cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
     if (!cpuc) return;
 
-    cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+    cgrp = scx_bpf_task_cgroup(p);
     if ( cgrp )
     {
         cgc = find_cgrp_ctx(cgrp);
@@ -3360,6 +3434,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)fcg_cgroup_move,
         .init			    = (void *)fcg_init,
         .exit			    = (void *)fcg_exit,
-        .flags			    = SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST, //| SCX_OPS_SWITCH_PARTIAL,
+        .flags			    = SCX_OPS_ENQ_LAST, //| SCX_OPS_SWITCH_PARTIAL,
         .timeout_ms		    = 0,//10000U,
         .name			    = "weightedcg");
