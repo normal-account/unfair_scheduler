@@ -53,6 +53,88 @@ static inline double avg_ms(uint64_t sum, uint64_t cnt) { return cnt ? ( (double
 
 static inline double ns_to_ms(uint64_t ns) { return ns ? ( (double)ns / 1e6 ) : 0; }
 
+static const char * const callback_names[CALLBACK_NR] = {
+	[CALLBACK_SELECT_CPU] = "select_cpu",
+	[CALLBACK_ENQUEUE] = "enqueue",
+	[CALLBACK_DISPATCH] = "dispatch",
+	[CALLBACK_RUNNABLE] = "runnable",
+	[CALLBACK_RUNNING] = "running",
+	[CALLBACK_STOPPING] = "stopping",
+	[CALLBACK_QUIESCENT] = "quiescent",
+	[CALLBACK_DEQUEUE] = "dequeue",
+	[CALLBACK_INIT_TASK] = "init_task",
+	[CALLBACK_EXIT_TASK] = "exit_task",
+	[CALLBACK_CGROUP_SET_WEIGHT] = "cgroup_set_weight",
+	[CALLBACK_CGROUP_INIT] = "cgroup_init",
+	[CALLBACK_CGROUP_EXIT] = "cgroup_exit",
+	[CALLBACK_CGROUP_MOVE] = "cgroup_move",
+	[CALLBACK_INIT] = "init",
+	[CALLBACK_EXIT] = "exit",
+};
+
+static const char * const map_names[MAP_NR] = {
+	[MAP_STATS] = "stats",
+	[MAP_CPU_CTX] = "cpu_ctx",
+	[MAP_CGRP_CTX] = "cgrp_ctx",
+	[MAP_CGV_NODE_STASH] = "cgv_node_stash",
+	[MAP_CLS_CNTS] = "cls_cnts",
+	[MAP_CPUSET] = "cpuset_map",
+	[MAP_RT_TASK_ASSIGNMENTS] = "rt_assignments",
+	[MAP_TASK_VTIME] = "task_vtime",
+	[MAP_CGRP_STATS] = "cgrp_stats",
+	[MAP_TASK_CTX] = "task_ctx",
+};
+
+static const char * const map_op_names[MAP_OP_NR] = {
+	[MAP_OP_LOOKUP] = "lookup",
+	[MAP_OP_UPDATE] = "update",
+	[MAP_OP_DELETE] = "delete",
+	[MAP_OP_STORAGE_GET] = "storage_get",
+};
+
+static void print_callback_timings(struct scx_weightedcg_bpf *skel)
+{
+	int idx;
+
+	for (idx = 0; idx < CALLBACK_NR; idx++) {
+		const struct callback_timing *timing =
+			&skel->bss->callback_timing_stats[idx];
+
+		if (!timing->count)
+			continue;
+
+		printf("CALLBACK   %-17s avg:%9.1f ns calls:%12llu\n",
+		       callback_names[idx],
+		       (double)timing->total_ns / timing->count,
+		       (unsigned long long)timing->count);
+	}
+}
+
+static void print_map_timings(struct scx_weightedcg_bpf *skel)
+{
+	int map, op;
+
+	for (map = 0; map < MAP_NR; map++) {
+		for (op = 0; op < MAP_OP_NR; op++) {
+			const struct map_timing *timing =
+				&skel->bss->map_timing_stats[map][op];
+
+			if (!timing->count)
+				continue;
+
+			printf("MAP        %-18s %-11s avg:%9.1f ns max:%9llu ns "
+			       "slow(>=%u ns):%10llu (%5.2f%%) ops:%12llu\n",
+			       map_names[map], map_op_names[op],
+			       (double)timing->total_ns / timing->count,
+			       (unsigned long long)timing->max_ns,
+			       MAP_SLOW_OP_NS,
+			       (unsigned long long)timing->slow_count,
+			       100.0 * timing->slow_count / timing->count,
+			       (unsigned long long)timing->count);
+		}
+	}
+}
+
 static void read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
 {
 	int fd = bpf_map__fd(skel->maps.cgrp_stats);
@@ -255,6 +337,8 @@ restart:
 		printf("BAD      remove:%6llu\n",
 		       acc_stats[STAT_BAD_REMOVAL]);
 
+		print_callback_timings(skel);
+		print_map_timings(skel);
 		read_cgrp_stats( skel );
 		
 		fflush(stdout);
@@ -263,6 +347,10 @@ restart:
 	}
 
 	bpf_link__destroy(link);
+	printf("\n[FINAL CALLBACK TIMINGS]\n");
+	print_callback_timings(skel);
+	printf("\n[FINAL MAP OPERATION TIMINGS]\n");
+	print_map_timings(skel);
 	ecode = UEI_REPORT(skel, uei);
 	scx_weightedcg_bpf__destroy(skel);
 

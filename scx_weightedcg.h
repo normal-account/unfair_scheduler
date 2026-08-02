@@ -1,6 +1,10 @@
 #ifndef __SCX_WEIGHTEDCG_H
 #define __SCX_WEIGHTEDCG_H
 
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
 enum {
 	HWEIGHT_ONE		= 1LLU << 16,
 };
@@ -41,6 +45,65 @@ enum stat_idx {
 
 	STAT_NR,
 };
+
+enum callback_idx {
+	CALLBACK_SELECT_CPU,
+	CALLBACK_ENQUEUE,
+	CALLBACK_DISPATCH,
+	CALLBACK_RUNNABLE,
+	CALLBACK_RUNNING,
+	CALLBACK_STOPPING,
+	CALLBACK_QUIESCENT,
+	CALLBACK_DEQUEUE,
+	CALLBACK_INIT_TASK,
+	CALLBACK_EXIT_TASK,
+	CALLBACK_CGROUP_SET_WEIGHT,
+	CALLBACK_CGROUP_INIT,
+	CALLBACK_CGROUP_EXIT,
+	CALLBACK_CGROUP_MOVE,
+	CALLBACK_INIT,
+	CALLBACK_EXIT,
+
+	CALLBACK_NR,
+};
+
+struct callback_timing {
+	__u64 total_ns;
+	__u64 count;
+};
+
+enum map_idx {
+	MAP_STATS,
+	MAP_CPU_CTX,
+	MAP_CGRP_CTX,
+	MAP_CGV_NODE_STASH,
+	MAP_CLS_CNTS,
+	MAP_CPUSET,
+	MAP_RT_TASK_ASSIGNMENTS,
+	MAP_TASK_VTIME,
+	MAP_CGRP_STATS,
+	MAP_TASK_CTX,
+
+	MAP_NR,
+};
+
+enum map_op_idx {
+	MAP_OP_LOOKUP,
+	MAP_OP_UPDATE,
+	MAP_OP_DELETE,
+	MAP_OP_STORAGE_GET,
+
+	MAP_OP_NR,
+};
+
+struct map_timing {
+	__u64 total_ns;
+	__u64 count;
+	__u64 max_ns;
+	__u64 slow_count;
+};
+
+#define MAP_SLOW_OP_NS 1000
 
 #define CPU_MASK_BITS 96
 #define MASK_WORDS    (CPU_MASK_BITS / 64)
@@ -96,10 +159,6 @@ struct cgrp_stats {
 
 #ifndef DIR_ENQ
 #define DIR_ENQ 1
-#endif
-
-#ifndef DEBUG
-#define DEBUG 0
 #endif
 
 #ifndef RT_VTIME

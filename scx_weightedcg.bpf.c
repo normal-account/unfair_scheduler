@@ -38,11 +38,83 @@ struct {
     __uint(max_entries, STAT_NR);
 } stats SEC(".maps");
 
+struct callback_timing callback_timing_stats[CALLBACK_NR];
+
+static __always_inline u64 callback_timer_start(void)
+{
+    return bpf_ktime_get_ns();
+}
+
+static __always_inline void callback_timer_record(enum callback_idx callback,
+                                                   u64 started_at)
+{
+    u64 elapsed = bpf_ktime_get_ns() - started_at;
+
+    __sync_fetch_and_add(&callback_timing_stats[callback].total_ns, elapsed);
+    __sync_fetch_and_add(&callback_timing_stats[callback].count, 1);
+}
+
+struct map_timing map_timing_stats[MAP_NR][MAP_OP_NR];
+
+static __always_inline void map_timer_record(enum map_idx map,
+                                             enum map_op_idx op,
+                                             u64 started_at)
+{
+    struct map_timing *timing = &map_timing_stats[map][op];
+    u64 elapsed = bpf_ktime_get_ns() - started_at;
+    u64 old_max = __sync_fetch_and_add(&timing->max_ns, 0);
+
+    __sync_fetch_and_add(&timing->total_ns, elapsed);
+    __sync_fetch_and_add(&timing->count, 1);
+    if (elapsed >= MAP_SLOW_OP_NS)
+        __sync_fetch_and_add(&timing->slow_count, 1);
+
+    if (elapsed > old_max)
+        __sync_val_compare_and_swap(&timing->max_ns, old_max, elapsed);
+}
+
+#define map_lookup_elem(map, key, map_idx) ({                              \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    void *__value = bpf_map_lookup_elem((map), (key));                     \
+    map_timer_record((map_idx), MAP_OP_LOOKUP, __started_at);               \
+    __value;                                                               \
+})
+
+#define map_update_elem(map, key, value, flags, map_idx) ({                 \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    long __ret = bpf_map_update_elem((map), (key), (value), (flags));       \
+    map_timer_record((map_idx), MAP_OP_UPDATE, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define map_delete_elem(map, key, map_idx) ({                               \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    long __ret = bpf_map_delete_elem((map), (key));                         \
+    map_timer_record((map_idx), MAP_OP_DELETE, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define cgrp_storage_get(cgrp, value, flags) ({                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    void *__value = bpf_cgrp_storage_get(&cgrp_ctx, (cgrp), (value),        \
+                                         (flags));                          \
+    map_timer_record(MAP_CGRP_CTX, MAP_OP_STORAGE_GET, __started_at);       \
+    __value;                                                               \
+})
+
+#define task_storage_get(task, value, flags) ({                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    void *__value = bpf_task_storage_get(&task_ctx, (task), (value),        \
+                                         (flags));                          \
+    map_timer_record(MAP_TASK_CTX, MAP_OP_STORAGE_GET, __started_at);       \
+    __value;                                                               \
+})
+
 static void stat_inc(enum stat_idx idx)
 {
     u32 idx_v = idx;
 
-    u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx_v);
+    u64 *cnt_p = map_lookup_elem(&stats, &idx_v, MAP_STATS);
     if (cnt_p)
         (*cnt_p)++;
 }
@@ -148,7 +220,7 @@ struct {
 static __always_inline void cls_inc(u32 is_rt)
 {
     u32 k = 0;
-    struct cls_counters *c = bpf_map_lookup_elem(&cls_cnts, &k);
+    struct cls_counters *c = map_lookup_elem(&cls_cnts, &k, MAP_CLS_CNTS);
     if (!c) return;
     if (is_rt) 
         __sync_fetch_and_add(&c->rt, 1);   // lowers to BPF_XADD
@@ -159,7 +231,7 @@ static __always_inline void cls_inc(u32 is_rt)
 static __always_inline void cls_dec(u32 is_rt)
 {
     u32 k = 0;
-    struct cls_counters *c = bpf_map_lookup_elem(&cls_cnts, &k);
+    struct cls_counters *c = map_lookup_elem(&cls_cnts, &k, MAP_CLS_CNTS);
     if (!c) return;
     if (is_rt)
         __sync_fetch_and_sub(&c->rt, 1);
@@ -170,14 +242,14 @@ static __always_inline void cls_dec(u32 is_rt)
 static __always_inline u64 cls_get_rt(void)
 {
     u32 k = 0;
-    struct cls_counters *c = bpf_map_lookup_elem(&cls_cnts, &k);
+    struct cls_counters *c = map_lookup_elem(&cls_cnts, &k, MAP_CLS_CNTS);
     return c ? c->rt : 0;
 }
 
 static __always_inline u64 cls_get_bk(void)
 {
     u32 k = 0;
-    struct cls_counters *c = bpf_map_lookup_elem(&cls_cnts, &k);
+    struct cls_counters *c = map_lookup_elem(&cls_cnts, &k, MAP_CLS_CNTS);
     return c ? c->bk : 0;
 }
 
@@ -219,7 +291,7 @@ static __always_inline void decrement_enq_count( struct task_ctx *taskc, struct 
             struct cgroup *cg = bpf_cgroup_from_id(enq_cgid);
             if ( cg )
             {
-                cgc = bpf_cgrp_storage_get(&cgrp_ctx, cg, 0, 0);
+                cgc = cgrp_storage_get(cg, 0, 0);
                 bpf_cgroup_release(cg);
             }
         }
@@ -307,7 +379,7 @@ enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
 
 static __always_inline enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
 {  
-    struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc) return CPU_BK; // conservative
 
     if (__sync_fetch_and_add(&cpuc->rt_cnt, 0) )
@@ -355,7 +427,7 @@ struct {
 
 static __always_inline void cpuset_ensure_entry(__u64 cgid) {
     struct cpuset_bits zero = {};
-    bpf_map_update_elem(&cpuset_map, &cgid, &zero, BPF_NOEXIST);
+    map_update_elem(&cpuset_map, &cgid, &zero, BPF_NOEXIST, MAP_CPUSET);
 }
 
 static __always_inline void mask_set_cpu(struct cpuset_bits *st, __u32 cpu) {
@@ -402,7 +474,7 @@ static long refresh_cgrp_cpuset_cb(u32 cpu, void *data)
 
 static __always_inline void refresh_cgrp_cpuset(__u64 cgid, const struct task_struct *p)
 {
-    struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid);
+    struct cpuset_bits *st = map_lookup_elem(&cpuset_map, &cgid, MAP_CPUSET);
     if (!st) return;
 
     __builtin_memset(st->mask, 0, sizeof(st->mask));
@@ -423,7 +495,7 @@ static __always_inline u64 rt_assigned_count(u32 cpu)
     if (cpu >= nr_cpus)
         return ~0ULL;
 
-    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc)
         return ~0ULL;
 
@@ -437,7 +509,7 @@ static __always_inline void rt_assigned_count_inc(u32 cpu)
     if (cpu >= nr_cpus)
         return;
 
-    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (cpuc)
         __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 1);
 }
@@ -450,7 +522,7 @@ static __always_inline void rt_assigned_count_dec(u32 cpu)
     if (cpu >= nr_cpus)
         return;
 
-    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc)
         return;
 
@@ -486,7 +558,7 @@ static long least_assigned_cpu_cb(u32 cpu, void *data)
     if (!assignment_cpuset_allows(ctx->st, cpu))
         return 0;
 
-    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     u64 count = cpuc ? __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 0) : ~0ULL;
 
     if (count < ctx->best_count) {
@@ -657,7 +729,7 @@ static __always_inline void dump_cgroup_tasks( u32 pid, u64 cgid, u64 vtime )
         .cgid  = cgid,
         .vtime = vtime,
     };
-    bpf_map_update_elem(&task_vtime_map, &pid, &info, BPF_ANY);
+    map_update_elem(&task_vtime_map, &pid, &info, BPF_ANY, MAP_TASK_VTIME);
 
     // 2. Dump all tasks and their vtime
     struct dump_cgroup_tasks_ctx ctx = {
@@ -754,15 +826,17 @@ static void cgrp_enqueue_stat( struct cgroup *cgrp, struct cgrp_ctx* cgc, s32 pi
 
     if ( cgid <= 1 ) return; // Ignore default cgroup
 
-    struct cgrp_stats *cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid );
+    struct cgrp_stats *cg_stat = map_lookup_elem(&cgrp_stats, &cgid,
+                                                 MAP_CGRP_STATS);
     if (!cg_stat) {
         struct cgrp_stats zero = {};
-        if (bpf_map_update_elem(&cgrp_stats, &cgid, &zero, BPF_NOEXIST))
+        if (map_update_elem(&cgrp_stats, &cgid, &zero, BPF_NOEXIST,
+                            MAP_CGRP_STATS))
         {
             return;
         }
         
-        cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid);
+        cg_stat = map_lookup_elem(&cgrp_stats, &cgid, MAP_CGRP_STATS);
     
         if (!cg_stat) return;
 
@@ -791,7 +865,8 @@ static void cgrp_dispatch_stat( __u64 cgid, struct cgrp_ctx* cgc, struct cpu_ctx
     if ( !cgc || !cpuc ) return;
 
     // 1. Store enqueue-dispatch stats
-    struct cgrp_stats *cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid );
+    struct cgrp_stats *cg_stat = map_lookup_elem(&cgrp_stats, &cgid,
+                                                 MAP_CGRP_STATS);
     if (!cg_stat) return;
 
     // Read atomically
@@ -843,7 +918,8 @@ static void cgrp_running_stat( __u64 cgid, struct cgrp_ctx* cgc, struct cpu_ctx 
 #if DEBUG
     if ( !cgc || !cpuc ) return;
 
-    struct cgrp_stats *cg_stat = bpf_map_lookup_elem( &cgrp_stats, &cgid );
+    struct cgrp_stats *cg_stat = map_lookup_elem(&cgrp_stats, &cgid,
+                                                 MAP_CGRP_STATS);
     if (!cg_stat) return;
 
     // Read atomically
@@ -873,7 +949,8 @@ task_enqueue_stat(struct task_struct *p, struct task_ctx *taskc, u64 cgid, bool 
     if (p->pid <= 0)
         return;
 
-    struct cgrp_stats *cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid);
+    struct cgrp_stats *cg_stat = map_lookup_elem(&cgrp_stats, &cgid,
+                                                 MAP_CGRP_STATS);
     if (!cg_stat)
         return;
 
@@ -921,7 +998,8 @@ task_running_stat(struct task_struct *p, struct task_ctx *taskc,
     u64 lat = now - ts;
 
     // Attribute to cgroup stats
-    struct cgrp_stats *cg_stat = bpf_map_lookup_elem(&cgrp_stats, &cgid);
+    struct cgrp_stats *cg_stat = map_lookup_elem(&cgrp_stats, &cgid,
+                                                 MAP_CGRP_STATS);
     if (!cg_stat)
         return;
 
@@ -1060,7 +1138,7 @@ static __always_inline void dump_bk_tree(void)
 static struct cpu_ctx *find_cpu_ctx(u32 cpu)
 {
     struct cpu_ctx *cpuc;
-    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc) {
         scx_bpf_error("cpu_ctx lookup failed");
         return NULL;
@@ -1072,7 +1150,7 @@ static struct cgrp_ctx *find_cgrp_ctx(struct cgroup *cgrp)
 {
     struct cgrp_ctx *cgc;
 
-    cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+    cgc = cgrp_storage_get(cgrp, 0, 0);
     if (!cgc) {
         scx_bpf_error("cgrp_ctx lookup failed for cgid %llu", cgrp->kn->id);
         return NULL;
@@ -1191,7 +1269,7 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
     bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
 #endif
 
-    stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
+    stash = map_lookup_elem(&cgv_node_stash, &cgid, MAP_CGV_NODE_STASH);
     if (!stash) {
         scx_bpf_error("cgv_node lookup failed for cgid %llu", cgid);
         return;
@@ -1284,11 +1362,12 @@ static u32 assign_rt_cpu(struct task_struct *p,
     cgid = cgrp->kn->id;
     refresh_cgrp_cpuset(cgid, p);
 
-    st = bpf_map_lookup_elem(&cpuset_map, &cgid);
+    st = map_lookup_elem(&cpuset_map, &cgid, MAP_CPUSET);
     if (!st || !st->init)
         return find_first_allowed_cpu((const struct cpumask *)p->cpus_ptr);
 
-    old_asn = bpf_map_lookup_elem(&rt_task_assignments, &pid);
+    old_asn = map_lookup_elem(&rt_task_assignments, &pid,
+                              MAP_RT_TASK_ASSIGNMENTS);
     if (old_asn) {
         old_cpu = old_asn->cpu;
 
@@ -1318,7 +1397,8 @@ static u32 assign_rt_cpu(struct task_struct *p,
     new_asn.cgid = cgid;
     new_asn.cpuset = *st;
 
-    bpf_map_update_elem(&rt_task_assignments, &pid, &new_asn, BPF_ANY);
+    map_update_elem(&rt_task_assignments, &pid, &new_asn, BPF_ANY,
+                    MAP_RT_TASK_ASSIGNMENTS);
     taskc->rt_cpu = new_cpu;
 
     log("\tassign_rt_cpu: pid %d comm %s cgid=%llu cpu %u -> %u",
@@ -1332,7 +1412,7 @@ static u32 assign_rt_cpu(struct task_struct *p,
 static u32 get_or_assign_rt_cpu(struct task_struct *p,
                                                 const struct cpumask *allowed)
 {
-    struct task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx * taskc = task_storage_get(p, 0, 0);
     struct rt_task_assignment *asn;
     struct cgroup *cgrp;
     u32 pid = (__u32)p->pid;
@@ -1344,7 +1424,8 @@ static u32 get_or_assign_rt_cpu(struct task_struct *p,
         return find_first_allowed_cpu(allowed);
     }
 
-    asn = bpf_map_lookup_elem(&rt_task_assignments, &pid);
+    asn = map_lookup_elem(&rt_task_assignments, &pid,
+                          MAP_RT_TASK_ASSIGNMENTS);
     if (asn && asn->cpu < nr_cpus && bpf_cpumask_test_cpu((s32)asn->cpu, allowed)) {
         taskc->rt_cpu = asn->cpu;
         return asn->cpu;
@@ -1368,7 +1449,8 @@ static void release_rt_cpu_assignment(struct task_struct *p,
     struct rt_task_assignment *asn;
     u32 old_cpu = nr_cpus;
 
-    asn = bpf_map_lookup_elem(&rt_task_assignments, &pid);
+    asn = map_lookup_elem(&rt_task_assignments, &pid,
+                          MAP_RT_TASK_ASSIGNMENTS);
     if (asn)
         old_cpu = asn->cpu;
     else if (taskc && taskc->rt_cpu < nr_cpus)
@@ -1377,7 +1459,7 @@ static void release_rt_cpu_assignment(struct task_struct *p,
     if (old_cpu < nr_cpus)
         rt_assigned_count_dec(old_cpu);
 
-    bpf_map_delete_elem(&rt_task_assignments, &pid);
+    map_delete_elem(&rt_task_assignments, &pid, MAP_RT_TASK_ASSIGNMENTS);
 
     if (taskc)
         taskc->rt_cpu = nr_cpus;
@@ -1420,7 +1502,7 @@ static u32 pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
 static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid, bool is_idle)
 {
     //struct cpu_ctx *cpuc = find_cpu_ctx(cpu);
-    struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc) return false;
 
     if (is_idle && __sync_fetch_and_add(&cpuc->bk_cnt_pending, 0))
@@ -1454,7 +1536,7 @@ static __always_inline void rt_clear_claim(u32 cpu, u32 pid)
 
 static __always_inline u32 cpu_load_for_pick(u32 cpu)
 {
-    struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
 
     if ( !cpuc ) return 0;
 
@@ -1670,11 +1752,11 @@ static void set_bypassed_at(struct task_struct *p, struct task_ctx *taskc)
 	taskc->bypassed_at = p->se.sum_exec_runtime ?: (u64)-1;
 }
 
-s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+static s32 select_cpu_impl(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
     bool is_idle = false;
 
-    struct task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx * taskc = task_storage_get(p, 0, 0);
     if (!taskc) {
         scx_bpf_error("task_ctx lookup failed");
         return prev_cpu;
@@ -1712,7 +1794,8 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
             taskc->sel_cpu = nr_cpus;
 
             bool is_behind = false;
-            struct cpu_ctx *tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
+            struct cpu_ctx *tgtc = map_lookup_elem(&cpu_ctx, &tgt,
+                                                   MAP_CPU_CTX);
             if (tgtc)
             {
                 #if RT_VTIME
@@ -1804,14 +1887,14 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
     // return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 }
 
-void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
+static void enqueue_impl(struct task_struct *p, u64 enq_flags)
 {
     struct task_ctx *taskc;
     struct cgroup *cgrp;
     struct cgrp_ctx *cgc;
     struct cpu_ctx *tgtc;
 
-    taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    taskc = task_storage_get(p, 0, 0);
     if (!taskc) {
         scx_bpf_error("task_ctx lookup failed");
         return;
@@ -1853,7 +1936,7 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
             taskc->sel_cls = cls;
         }
 
-        tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
+        tgtc = map_lookup_elem(&cpu_ctx, &tgt, MAP_CPU_CTX);
 
         // Task accounting
         task_enqueue_stat( p, taskc, cgid, is_idle, can_kick );
@@ -2089,7 +2172,7 @@ static void update_active_weight_sums(struct cgroup *cgrp, bool runnable)
         cgrp_refresh_hweight(cgrp, cgc);
 }
 
-void BPF_STRUCT_OPS(runnable, struct task_struct *p, u64 enq_flags)
+static void runnable_impl(struct task_struct *p, u64 enq_flags)
 {
     struct cgroup *cgrp;
     struct cgrp_ctx *cgc;
@@ -2106,7 +2189,7 @@ void BPF_STRUCT_OPS(runnable, struct task_struct *p, u64 enq_flags)
     bpf_cgroup_release(cgrp);
 }
 
-void BPF_STRUCT_OPS(running, struct task_struct *p)
+static void running_impl(struct task_struct *p)
 {
     struct cgroup *cgrp;
     struct cgrp_ctx *cgc;
@@ -2129,7 +2212,7 @@ void BPF_STRUCT_OPS(running, struct task_struct *p)
     }
 
     u64 cgid = cgrp->kn->id;
-    struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx *taskc = task_storage_get(p, 0, 0);
     if (taskc) {
         taskc->last_cpu = cpu;
         
@@ -2180,7 +2263,7 @@ void BPF_STRUCT_OPS(running, struct task_struct *p)
     bpf_cgroup_release(cgrp);
 }
 
-void BPF_STRUCT_OPS(stopping, struct task_struct *p, bool runnable)
+static void stopping_impl(struct task_struct *p, bool runnable)
 {
     struct task_ctx *taskc;
     struct cgroup *cgrp;
@@ -2191,7 +2274,7 @@ void BPF_STRUCT_OPS(stopping, struct task_struct *p, bool runnable)
 
 
     int rt_class = 0;
-    taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    taskc = task_storage_get(p, 0, 0);
     if (!taskc) {
         scx_bpf_error("task_ctx lookup failed");
         goto log_and_out;
@@ -2289,10 +2372,10 @@ log_and_out:
 }
 
 #define DEQUEUE_SLEEP 1
-void BPF_STRUCT_OPS(dequeue, struct task_struct *p, u64 deq_flags)
+static void dequeue_impl(struct task_struct *p, u64 deq_flags)
 {
 #if WEIGHTED_FALLBACK_DSQ
-    struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx *taskc = task_storage_get(p, 0, 0);
     if (taskc) {
         taskc->fallback_weighted = 0;
         taskc->fallback_slice_ns = 0;
@@ -2309,7 +2392,7 @@ void BPF_STRUCT_OPS(dequeue, struct task_struct *p, u64 deq_flags)
     }
 }
 
-void BPF_STRUCT_OPS(quiescent, struct task_struct *p, u64 deq_flags)
+static void quiescent_impl(struct task_struct *p, u64 deq_flags)
 {
     struct cgrp_ctx *cgc;
     struct cgroup *cgrp;
@@ -2322,7 +2405,7 @@ void BPF_STRUCT_OPS(quiescent, struct task_struct *p, u64 deq_flags)
     // Decrement the enq_count if applicable and set the enq cgid to 0
     if ( cgc )
     {
-        struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+        struct task_ctx *taskc = task_storage_get(p, 0, 0);
         decrement_enq_count( taskc, cgc, cgrp->kn->id );
     }
 
@@ -2330,14 +2413,14 @@ void BPF_STRUCT_OPS(quiescent, struct task_struct *p, u64 deq_flags)
     #if DEBUG
     {
         __u32 pid = (__u32)p->pid;
-        bpf_map_delete_elem(&task_vtime_map, &pid);
+        map_delete_elem(&task_vtime_map, &pid, MAP_TASK_VTIME);
     }
     #endif
 
     bpf_cgroup_release(cgrp);
 }
 
-void BPF_STRUCT_OPS(cgroup_set_weight, struct cgroup *cgrp, u32 weight)
+static void cgroup_set_weight_impl(struct cgroup *cgrp, u32 weight)
 {
     struct cgrp_ctx *cgc, *pcgc = NULL;
 
@@ -2369,7 +2452,8 @@ inline static void try_stash_node( u64 cgid, struct cgrp_ctx *cgc, struct bpf_rb
 {
     if ( NULL == cgc || NULL == cgv_tree || NULL == cgv_node ) return;
 
-    struct cgv_node_stash *stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
+    struct cgv_node_stash *stash =
+        map_lookup_elem(&cgv_node_stash, &cgid, MAP_CGV_NODE_STASH);
 
     if ( stash )
     {
@@ -2433,7 +2517,8 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 
     cgrp = bpf_cgroup_from_id(cgid);
 
-    if (cgrp) cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+    if (cgrp)
+        cgc = cgrp_storage_get(cgrp, 0, 0);
     if (!cgrp || !cgc) 
     {
         stat_inc(STAT_PNC_GONE);
@@ -2445,7 +2530,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         return true;
     }
 
-    struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid);
+    struct cpuset_bits *st = map_lookup_elem(&cpuset_map, &cgid, MAP_CPUSET);
     if (!st || !st->init || !mask_test_cpu(st, (u32)cpu)) 
     {
         log("\t\ttry_pick_next_cgroup: cgid %llu not allowed on cpu %d (is RT tree %d)",
@@ -2575,7 +2660,7 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
 }
 
 
-void BPF_STRUCT_OPS(dispatch, s32 cpu, struct task_struct *prev)
+static void dispatch_impl(s32 cpu, struct task_struct *prev)
 {
     struct cpu_ctx *cpuc;
     struct cgrp_ctx *cgc;
@@ -2612,7 +2697,7 @@ void BPF_STRUCT_OPS(dispatch, s32 cpu, struct task_struct *prev)
 
         cgrp = bpf_cgroup_from_id(cpuc->cur_bk_cgid);
         if (cgrp) {
-            cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+            cgc = cgrp_storage_get(cgrp, 0, 0);
         }
 
         /* If current is BK and *any* RT is pending, try RT first. */
@@ -2672,7 +2757,7 @@ void BPF_STRUCT_OPS(dispatch, s32 cpu, struct task_struct *prev)
         goto pick_next_cgroup;
     }
 
-    cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+    cgc = cgrp_storage_get(cgrp, 0, 0);
     if (cgc) {
 		bpf_spin_lock(&cgv_tree_lock);
 		__sync_fetch_and_add(&cgc->cvtime_delta,
@@ -2743,8 +2828,8 @@ pick_next_cgroup:
     }
 }
 
-s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
-        struct scx_init_task_args *args)
+static s32 init_task_impl(struct task_struct *p,
+                          struct scx_init_task_args *args)
 {
     struct task_ctx *taskc;
     struct cgrp_ctx *cgc;
@@ -2753,8 +2838,7 @@ s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
     * @p is new. Let's ensure that its task_ctx is available. We can sleep
     * in this function and the following will automatically use GFP_KERNEL.
     */
-    taskc = bpf_task_storage_get(&task_ctx, p, 0,
-                    BPF_LOCAL_STORAGE_GET_F_CREATE);
+    taskc = task_storage_get(p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!taskc)
         return -ENOMEM;
 
@@ -2790,8 +2874,8 @@ s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
     return 0;
 }
 
-int BPF_STRUCT_OPS_SLEEPABLE(cgroup_init, struct cgroup *cgrp,
-                struct scx_cgroup_init_args *args)
+static int cgroup_init_impl(struct cgroup *cgrp,
+                            struct scx_cgroup_init_args *args)
 {
     struct cgrp_ctx *cgc;
     struct cgv_node *cgv_node;
@@ -2808,8 +2892,7 @@ int BPF_STRUCT_OPS_SLEEPABLE(cgroup_init, struct cgroup *cgrp,
     if (ret)
         return ret;
 
-    cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0,
-                BPF_LOCAL_STORAGE_GET_F_CREATE);
+    cgc = cgrp_storage_get(cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (!cgc) {
         ret = -ENOMEM;
         goto err_destroy_dsq;
@@ -2821,8 +2904,8 @@ int BPF_STRUCT_OPS_SLEEPABLE(cgroup_init, struct cgroup *cgrp,
 
     cpuset_ensure_entry( cgid );
 
-    ret = bpf_map_update_elem(&cgv_node_stash, &cgid, &empty_stash,
-                BPF_NOEXIST);
+    ret = map_update_elem(&cgv_node_stash, &cgid, &empty_stash,
+                          BPF_NOEXIST, MAP_CGV_NODE_STASH);
     if (ret) {
         if (ret != -ENOMEM)
             scx_bpf_error("unexpected stash creation error (%d)",
@@ -2830,7 +2913,7 @@ int BPF_STRUCT_OPS_SLEEPABLE(cgroup_init, struct cgroup *cgrp,
         goto err_destroy_dsq;
     }
 
-    stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
+    stash = map_lookup_elem(&cgv_node_stash, &cgid, MAP_CGV_NODE_STASH);
     if (!stash) {
         scx_bpf_error("unexpected cgv_node stash lookup failure");
         ret = -ENOENT;
@@ -2860,13 +2943,13 @@ int BPF_STRUCT_OPS_SLEEPABLE(cgroup_init, struct cgroup *cgrp,
 err_drop:
     bpf_obj_drop(cgv_node);
 err_del_cgv_node:
-    bpf_map_delete_elem(&cgv_node_stash, &cgid);
+    map_delete_elem(&cgv_node_stash, &cgid, MAP_CGV_NODE_STASH);
 err_destroy_dsq:
     scx_bpf_destroy_dsq(cgid);
     return ret;
 }
 
-void BPF_STRUCT_OPS(cgroup_exit, struct cgroup *cgrp)
+static void cgroup_exit_impl(struct cgroup *cgrp)
 {
     u64 cgid = cgrp->kn->id;
 
@@ -2875,12 +2958,12 @@ void BPF_STRUCT_OPS(cgroup_exit, struct cgroup *cgrp)
     * cgv_tree. Let's drain them in the dispatch path as they get popped
     * off the front of the tree.
     */
-    bpf_map_delete_elem(&cgv_node_stash, &cgid);
+    map_delete_elem(&cgv_node_stash, &cgid, MAP_CGV_NODE_STASH);
     scx_bpf_destroy_dsq(cgid);
 }
 
-void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
-            struct cgroup *from, struct cgroup *to)
+static void cgroup_move_impl(struct task_struct *p,
+                             struct cgroup *from, struct cgroup *to)
 {
     struct cgrp_ctx *from_cgc, *to_cgc;
     struct cgroup *cgrp;
@@ -2895,7 +2978,7 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
     delta = time_delta(p->scx.dsq_vtime, from_cgc->tvtime_now);
     p->scx.dsq_vtime = to_cgc->tvtime_now + delta;
 
-    struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx *taskc = task_storage_get(p, 0, 0);
     if ( !taskc ) return;
 
     if (to_cgc->rt_class)
@@ -2925,30 +3008,30 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
 
     log("\tcgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", rt_class, p->pid, cur_cpu, from->kn->id, to->kn->id);
 
-    struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
+    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cur_cpu, MAP_CPU_CTX);
     if (!cpuc) return;
 
     cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0);
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(init)
+static s32 init_impl(void)
 {
     return scx_bpf_create_dsq(FALLBACK_DSQ, -1);
 }
 
-void BPF_STRUCT_OPS(ufs_exit, struct scx_exit_info *ei)
+static void ufs_exit_impl(struct scx_exit_info *ei)
 {
     UEI_RECORD(uei, ei);
 }
 
-void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+static void exit_task_impl(struct task_struct *p, struct scx_exit_task_args *args)
 {
     struct cgroup *cgrp;
     struct cgrp_ctx *cgc;
     u64 cgid = 0;
     u8 rt_class = 0;
 
-    struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct task_ctx *taskc = task_storage_get(p, 0, 0);
     if ( !taskc ) 
     {
         scx_bpf_error("exit_task: !taskc for pid %d", p->pid);
@@ -2964,7 +3047,7 @@ void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args 
         return;
     }
 
-    struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
+    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cur_cpu, MAP_CPU_CTX);
     if (!cpuc) return;
 
     cgrp = scx_bpf_task_cgroup(p);
@@ -2986,6 +3069,126 @@ void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args 
     #endif
 }
 
+s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+    u64 started_at = callback_timer_start();
+    s32 ret = select_cpu_impl(p, prev_cpu, wake_flags);
+    callback_timer_record(CALLBACK_SELECT_CPU, started_at);
+    return ret;
+}
+
+void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
+{
+    u64 started_at = callback_timer_start();
+    enqueue_impl(p, enq_flags);
+    callback_timer_record(CALLBACK_ENQUEUE, started_at);
+}
+
+void BPF_STRUCT_OPS(dispatch, s32 cpu, struct task_struct *prev)
+{
+    u64 started_at = callback_timer_start();
+    dispatch_impl(cpu, prev);
+    callback_timer_record(CALLBACK_DISPATCH, started_at);
+}
+
+void BPF_STRUCT_OPS(runnable, struct task_struct *p, u64 enq_flags)
+{
+    u64 started_at = callback_timer_start();
+    runnable_impl(p, enq_flags);
+    callback_timer_record(CALLBACK_RUNNABLE, started_at);
+}
+
+void BPF_STRUCT_OPS(running, struct task_struct *p)
+{
+    u64 started_at = callback_timer_start();
+    running_impl(p);
+    callback_timer_record(CALLBACK_RUNNING, started_at);
+}
+
+void BPF_STRUCT_OPS(stopping, struct task_struct *p, bool runnable)
+{
+    u64 started_at = callback_timer_start();
+    stopping_impl(p, runnable);
+    callback_timer_record(CALLBACK_STOPPING, started_at);
+}
+
+void BPF_STRUCT_OPS(quiescent, struct task_struct *p, u64 deq_flags)
+{
+    u64 started_at = callback_timer_start();
+    quiescent_impl(p, deq_flags);
+    callback_timer_record(CALLBACK_QUIESCENT, started_at);
+}
+
+void BPF_STRUCT_OPS(dequeue, struct task_struct *p, u64 deq_flags)
+{
+    u64 started_at = callback_timer_start();
+    dequeue_impl(p, deq_flags);
+    callback_timer_record(CALLBACK_DEQUEUE, started_at);
+}
+
+s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
+                   struct scx_init_task_args *args)
+{
+    u64 started_at = callback_timer_start();
+    s32 ret = init_task_impl(p, args);
+    callback_timer_record(CALLBACK_INIT_TASK, started_at);
+    return ret;
+}
+
+void BPF_STRUCT_OPS(exit_task, struct task_struct *p,
+                    struct scx_exit_task_args *args)
+{
+    u64 started_at = callback_timer_start();
+    exit_task_impl(p, args);
+    callback_timer_record(CALLBACK_EXIT_TASK, started_at);
+}
+
+void BPF_STRUCT_OPS(cgroup_set_weight, struct cgroup *cgrp, u32 weight)
+{
+    u64 started_at = callback_timer_start();
+    cgroup_set_weight_impl(cgrp, weight);
+    callback_timer_record(CALLBACK_CGROUP_SET_WEIGHT, started_at);
+}
+
+int BPF_STRUCT_OPS_SLEEPABLE(cgroup_init, struct cgroup *cgrp,
+                             struct scx_cgroup_init_args *args)
+{
+    u64 started_at = callback_timer_start();
+    int ret = cgroup_init_impl(cgrp, args);
+    callback_timer_record(CALLBACK_CGROUP_INIT, started_at);
+    return ret;
+}
+
+void BPF_STRUCT_OPS(cgroup_exit, struct cgroup *cgrp)
+{
+    u64 started_at = callback_timer_start();
+    cgroup_exit_impl(cgrp);
+    callback_timer_record(CALLBACK_CGROUP_EXIT, started_at);
+}
+
+void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
+                    struct cgroup *from, struct cgroup *to)
+{
+    u64 started_at = callback_timer_start();
+    cgroup_move_impl(p, from, to);
+    callback_timer_record(CALLBACK_CGROUP_MOVE, started_at);
+}
+
+s32 BPF_STRUCT_OPS_SLEEPABLE(init)
+{
+    u64 started_at = callback_timer_start();
+    s32 ret = init_impl();
+    callback_timer_record(CALLBACK_INIT, started_at);
+    return ret;
+}
+
+void BPF_STRUCT_OPS(ufs_exit, struct scx_exit_info *ei)
+{
+    u64 started_at = callback_timer_start();
+    ufs_exit_impl(ei);
+    callback_timer_record(CALLBACK_EXIT, started_at);
+}
+
 SCX_OPS_DEFINE(weightedcg_ops,
         .select_cpu		    = (void *)select_cpu,
         .enqueue			= (void *)enqueue,
@@ -3003,6 +3206,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)cgroup_move,
         .init			    = (void *)init,
         .exit			    = (void *)ufs_exit,
-        .flags			    = SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST,
+        .flags			    = /*SCX_OPS_HAS_CGROUP_WEIGHT || */SCX_OPS_ENQ_LAST,
         .timeout_ms		    = 0,
         .name			    = "weightedcg");
