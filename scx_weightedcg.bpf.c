@@ -1733,7 +1733,8 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
             }
 
             u64 rt_flags = SCX_ENQ_CPU_SELECTED;
-            if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+            if ( is_idle || can_kick || is_behind )
+                rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
 
@@ -1744,8 +1745,8 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
 
             if ( is_idle )
                 scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-           else if ( can_kick || is_behind)
-                scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
+           //else if ( can_kick || is_behind)
+           //     scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
 
 
             bpf_cgroup_release(cgrp);
@@ -1882,7 +1883,8 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
         // Task direct enqueue 
         u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
 
-        if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+        if ( is_idle || can_kick || is_behind ) 
+            rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
 #if WEIGHTED_FALLBACK_DSQ
         taskc->fallback_weighted = 0;
@@ -1902,8 +1904,8 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
         }
         else if ( can_kick || is_behind )
         {
-            log("\tenqueue: direct kick PREEMPT CPU %d for pid %d ", /*cgc->rt_class*/2, tgt, p->pid);
-            scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
+            //log("\tenqueue: direct kick PREEMPT CPU %d for pid %d ", /*cgc->rt_class*/2, tgt, p->pid);
+            //scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
         }
     }
     else
@@ -1924,6 +1926,7 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
              * more control over when tasks with custom cpumask get issued.
              */
             //
+            //if (p->nr_cpus_allowed == 1) {
             //if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
             if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
                 stat_inc(STAT_LOCAL);
@@ -2883,14 +2886,19 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
             struct cgroup *from, struct cgroup *to)
 {
     struct cgrp_ctx *from_cgc, *to_cgc;
-    struct cgroup *cgrp;
-    struct cgrp_ctx *cgc;
     s64 delta;
-    u8 rt_class = 0;
+    bool was_rt;
 
-    /* find_cgrp_ctx() triggers scx_ops_error() on lookup failures */
-    if (!(from_cgc = find_cgrp_ctx(from)) || !(to_cgc = find_cgrp_ctx(to)))
+    /*
+     * cgroup_move has no sched_ext kfunc permissions. In particular, don't
+     * call find_cgrp_ctx(), scx_bpf_task_cgroup(), or scx_bpf_error() here.
+     */
+    from_cgc = bpf_cgrp_storage_get(&cgrp_ctx, from, 0, 0);
+    to_cgc = bpf_cgrp_storage_get(&cgrp_ctx, to, 0, 0);
+    if (!from_cgc || !to_cgc)
         return;
+
+    was_rt = from_cgc->rt_class;
 
     delta = time_delta(p->scx.dsq_vtime, from_cgc->tvtime_now);
     p->scx.dsq_vtime = to_cgc->tvtime_now + delta;
@@ -2912,23 +2920,20 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
     if ( cur_cpu >= nr_cpus )
         return;
 
-    cgrp = scx_bpf_task_cgroup(p);
-    if ( cgrp )
-    {
-        cgc = find_cgrp_ctx(cgrp);
-        if ( cgc )
-        {
-            rt_class = cgc->rt_class;
-        }
-    }
-    bpf_cgroup_release(cgrp);
-
-    log("\tcgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", rt_class, p->pid, cur_cpu, from->kn->id, to->kn->id);
+    log("\tcgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", was_rt, p->pid, cur_cpu, from->kn->id, to->kn->id);
 
     struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
-    if (!cpuc) return;
+    if (!cpuc)
+        return;
 
-    cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0);
+    cnt_dec(cpuc, was_rt, cur_cpu, p->pid, from->kn->id);
+
+    /*
+     * The task is no longer charged to its old scheduling residency. Clearing
+     * cur_cpu prevents stopping() from decrementing the old count again; the
+     * normal enqueue/running path will charge it using its destination class.
+     */
+    taskc->cur_cpu = nr_cpus;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(init)
@@ -3003,6 +3008,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)cgroup_move,
         .init			    = (void *)init,
         .exit			    = (void *)ufs_exit,
-        .flags			    = SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST,
+        .flags			    = /*SCX_OPS_HAS_CGROUP_WEIGHT ||*/ SCX_OPS_ENQ_LAST,
         .timeout_ms		    = 0,
         .name			    = "weightedcg");
