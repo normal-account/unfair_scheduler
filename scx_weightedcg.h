@@ -43,7 +43,7 @@ enum stat_idx {
 };
 
 #define CPU_MASK_BITS 96
-#define MASK_WORDS    (CPU_MASK_BITS / 64)
+#define MASK_WORDS    ((CPU_MASK_BITS + 63) / 64)
 
 struct cgrp_ctx {
 	u32			nr_active;
@@ -103,7 +103,7 @@ struct cgrp_stats {
 #endif
 
 #ifndef RT_VTIME
-#define RT_VTIME 0
+#define RT_VTIME 1
 #endif
 
 #ifndef RT_ACTIVE_CHECK
@@ -111,7 +111,7 @@ struct cgrp_stats {
 #endif
 
 #ifndef WEIGHTED_FALLBACK_DSQ
-#define WEIGHTED_FALLBACK_DSQ 0
+#define WEIGHTED_FALLBACK_DSQ 1
 #endif
 
 #ifndef PIN_TASKS
@@ -131,7 +131,7 @@ struct cgrp_stats {
 #endif
 
 #if DEBUG
-#define log(fmt, rt_class, ...) if ( true || rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif

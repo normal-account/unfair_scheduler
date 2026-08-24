@@ -11,7 +11,7 @@
 */
 enum {
     FALLBACK_DSQ		= 0,
-    CGROUP_MAX_RETRIES	= 1024,
+    CGROUP_MAX_RETRIES	= 3,
 };
 
 char _license[] SEC("license") = "GPL";
