@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <time.h>
+#include <numa.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
 #include "scx_weightedcg.h"
@@ -52,6 +53,22 @@ static inline double ns_to_s(uint64_t ns) { return (double)ns / 1e9; }
 static inline double avg_ms(uint64_t sum, uint64_t cnt) { return cnt ? ( (double)sum / cnt / 1e6 ) : 0; }
 
 static inline double ns_to_ms(uint64_t ns) { return ns ? ( (double)ns / 1e6 ) : 0; }
+
+static void init_cpu_numa_nodes(struct scx_weightedcg_bpf *skel)
+{
+	int cpu;
+
+	for (cpu = 0; cpu < MAX_CPUS; cpu++)
+		skel->rodata->cpu_numa_node[cpu] = NUMA_NO_NODE;
+
+	if (numa_available() < 0) {
+		fprintf(stderr, "NUMA topology unavailable; using global CPU selection\n");
+		return;
+	}
+
+	for (cpu = 0; cpu < skel->rodata->nr_cpus; cpu++)
+		skel->rodata->cpu_numa_node[cpu] = numa_node_of_cpu(cpu);
+}
 
 static void read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
 {
@@ -193,6 +210,8 @@ restart:
 
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
 	assert(skel->rodata->nr_cpus > 0);
+	assert(skel->rodata->nr_cpus <= MAX_CPUS);
+	init_cpu_numa_nodes(skel);
 
 	skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
     skel->rodata->task_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");

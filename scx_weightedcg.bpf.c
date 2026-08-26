@@ -19,6 +19,7 @@ char _license[] SEC("license") = "GPL";
 const volatile u32 nr_cpus;	/* !0 for veristat, set during init */
 const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
+const volatile s32 cpu_numa_node[MAX_CPUS];
 
 const u32 NR_CPUS_LOG = 96;
 #if RT_ACTIVE_CHECK
@@ -67,9 +68,6 @@ struct cpu_ctx {
     u64  first_move_ts;         // when we successfully moved that DSQ to local
 #endif
 };
-
-
-#define MAX_CPUS 1024
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -305,7 +303,7 @@ static __always_inline void cnt_dec(struct cpu_ctx *cpuc, bool is_rt, u32 cpu, s
 
 enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
 
-static __always_inline enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
+static __attribute__((noinline)) enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
 {  
     struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
     if (!cpuc) return CPU_BK; // conservative
@@ -1472,6 +1470,14 @@ static __always_inline void set_flags_from_cls(enum cpu_runcls cls,
     *can_kick = (cls == CPU_BK);
 }
 
+static __always_inline s32 numa_node_for_cpu(u32 cpu)
+{
+    if (cpu >= nr_cpus || cpu >= MAX_CPUS)
+        return NUMA_NO_NODE;
+
+    return cpu_numa_node[cpu];
+}
+
 /* Bounded Euclid gcd (verifier-friendly). */
 static __always_inline u32 gcd_u32(u32 a, u32 b)
 {
@@ -1508,6 +1514,95 @@ static __always_inline u32 pick_coprime_stride(u32 n)
 
     return step; /* 1 if we failed to find one in a few tries */
 }
+
+struct rt_cpu_scan_ctx {
+    const struct cpumask *allowed;
+    s32 preferred_node;
+    u32 local_only;
+    u32 pid;
+    u32 hint_cpu;
+    u32 n;
+    u32 idx;
+    u32 step;
+    u32 selected_idle;
+    u32 best_bk;
+    u32 best_rt;
+    u32 best_bk_load;
+    u32 best_rt_load;
+};
+
+static long scan_rt_cpu_cb(u32 unused, void *data)
+{
+    struct rt_cpu_scan_ctx *ctx = data;
+    u32 idx = ctx->idx;
+
+    if (bpf_cpumask_test_cpu((s32)idx, ctx->allowed) &&
+        (!ctx->local_only ||
+         numa_node_for_cpu(idx) == ctx->preferred_node)) {
+        enum cpu_runcls cls = cpu_cls(idx, ctx->pid);
+
+        if (cls == CPU_IDLING) {
+            if (rt_try_claim_cpu(idx, ctx->pid, true)) {
+                ctx->selected_idle = idx;
+                return 1;
+            }
+            if (ctx->best_rt == ctx->n)
+                ctx->best_rt = idx;
+        } else {
+            u32 load = cpu_load_for_pick(idx);
+
+            if (cls == CPU_BK) {
+                if (load < ctx->best_bk_load ||
+                    (load == ctx->best_bk_load && idx == ctx->hint_cpu)) {
+                    ctx->best_bk = idx;
+                    ctx->best_bk_load = load;
+                }
+            } else {
+                if (load < ctx->best_rt_load ||
+                    (load == ctx->best_rt_load && idx == ctx->hint_cpu)) {
+                    ctx->best_rt = idx;
+                    ctx->best_rt_load = load;
+                }
+            }
+        }
+    }
+
+    if (ctx->n > 1) {
+        idx += ctx->step;
+        if (idx >= ctx->n)
+            idx -= ctx->n;
+        ctx->idx = idx;
+    }
+
+    return 0;
+}
+
+static __attribute__((noinline)) u32
+scan_rt_cpus(struct rt_cpu_scan_ctx *scan, bool *is_idle, bool *can_kick)
+{
+    const u32 n = scan->n;
+
+    bpf_loop(n, scan_rt_cpu_cb, scan, 0);
+
+    if (scan->selected_idle != n) {
+        *is_idle = true;
+        return scan->selected_idle;
+    }
+
+    if (scan->best_bk != n &&
+        rt_try_claim_cpu(scan->best_bk, scan->pid, false)) {
+        set_flags_from_cls(CPU_BK, is_idle, can_kick);
+        return scan->best_bk;
+    }
+
+    if (scan->best_rt != n) {
+        set_flags_from_cls(CPU_RT, is_idle, can_kick);
+        return scan->best_rt;
+    }
+
+    return n;
+}
+
 static __attribute__((noinline)) u32
 pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
                         bool *is_idle, bool *can_kick)
@@ -1528,130 +1623,47 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
 
     const bool hint_ok = (hint_cpu < n) &&
                          bpf_cpumask_test_cpu((s32)hint_cpu, allowed);
-
-    enum cpu_runcls hint_cls = CPU_RT;
-    u32 hint_load = 0;
-
-    if (hint_ok) {
-        hint_cls = cpu_cls(hint_cpu, p->pid);
-        if (hint_cls != CPU_IDLING)
-            hint_load = cpu_load_for_pick(hint_cpu);
-    }
+    const s32 preferred_node = hint_ok ?
+                               numa_node_for_cpu(hint_cpu) : NUMA_NO_NODE;
 
     // Pseudo-random permutation (full cycle via coprime stride)
 
     u32 start = bpf_get_prandom_u32() % n;
     u32 step  = (n == 1) ? 0 : pick_coprime_stride(n);
-    u32 blacklisted = nr_cpus;
+    u32 cpu;
+    struct rt_cpu_scan_ctx scan = {
+        .allowed = allowed,
+        .preferred_node = preferred_node,
+        .local_only = preferred_node != NUMA_NO_NODE,
+        .pid = pid,
+        .hint_cpu = hint_cpu,
+        .n = n,
+        .idx = start,
+        .step = step,
+        .selected_idle = n,
+        .best_bk = n,
+        .best_rt = n,
+        .best_bk_load = ~0u,
+        .best_rt_load = ~0u,
+    };
 
-    u32 best_bk, best_rt, best_bk_load, best_rt_load;
+    if (preferred_node != NUMA_NO_NODE) {
+        cpu = scan_rt_cpus(&scan, is_idle, can_kick);
+        if (cpu < n)
+            return cpu;
 
-#pragma clang loop unroll(disable)
-    for (u32 attempt = 0; attempt < 2; attempt++) {
-        /* If hint is idle, try to claim it (don’t return unclaimed). */
-        if (hint_ok && hint_cls == CPU_IDLING) {
-            if (rt_try_claim_cpu(hint_cpu, pid, true)) {
-                *is_idle = true;
-                return hint_cpu;
-            }
-            /* someone else claimed it – fall through and scan */
-        }
-
-        best_bk = nr_cpus, best_bk_load = ~0u;
-        best_rt = nr_cpus, best_rt_load = ~0u;
-        
-        u32 idx = start;
-
-        u32 k = 0;
-        bpf_for(k, 0, n) {
-            if (bpf_cpumask_test_cpu((s32)idx, allowed)) {
-                enum cpu_runcls cls = cpu_cls(idx, p->pid);
-
-                if (cls == CPU_IDLING) {
-                    log("cpu IDLE=%u (cls=%u)", 2, idx);
-
-                    // Try to claim immediately; if fails, keep scanning.
-                    if (rt_try_claim_cpu(idx, pid, true)) {
-                        *is_idle = true;
-                        return idx;
-                    }
-
-                    // Prevent edge case where all CPUs are idle but claimed. This ensures a valid CPU is returned.
-                    if ( best_rt == nr_cpus ) 
-                    {
-                        log("fallback to best_rt=%u (cls=%u)", 1, idx, (u32)cls);
-                        best_rt = idx;
-                    }
-                } else {
-                    //log("cpu NOT IDLE=%u (cls=%u)", 1, idx, (u32)cls);
-
-                    u32 load = cpu_load_for_pick(idx);
-
-                    if (cls == CPU_BK) {
-                        if (load < best_bk_load && idx != blacklisted) {
-                            best_bk = idx;
-                            best_bk_load = load;
-                        }
-                    } else { /* CPU_RT */
-                        if (load < best_rt_load) {
-                            best_rt = idx;
-                            best_rt_load = load;
-                        }
-                    }
-                }
-            }
-
-            if (n > 1) {
-                idx += step;
-                if (idx >= n)
-                    idx -= n;
-            }
-        }
-
-
-        log("pick_cpu_to_kick_for_rt: best bk=%u and rt=%u for pid %d", 2, best_bk, best_rt, p->pid);
-
-        // Prefer BK, but claim deterministically before returning.
-        if (best_bk != nr_cpus) {
-            if (hint_ok && hint_cls == CPU_BK && hint_load == best_bk_load) {
-                if (rt_try_claim_cpu(hint_cpu, pid, false)) {
-                    set_flags_from_cls(hint_cls, is_idle, can_kick);
-                    return hint_cpu;
-                }
-                if (hint_cpu != best_bk && rt_try_claim_cpu(best_bk, pid, false)) {
-                    set_flags_from_cls(CPU_BK, is_idle, can_kick);
-                    return best_bk;
-                }
-            } else {
-                if (rt_try_claim_cpu(best_bk, pid, false)) {
-                    set_flags_from_cls(CPU_BK, is_idle, can_kick);
-                    return best_bk;
-                }
-            }
-
-            // claim failed -> retry a fresh permutation
-            blacklisted = best_bk;
-        }
-        // nothing usable this attempt
+        scan.local_only = false;
+        scan.idx = start;
+        scan.selected_idle = n;
+        scan.best_bk = n;
+        scan.best_rt = n;
+        scan.best_bk_load = ~0u;
+        scan.best_rt_load = ~0u;
     }
 
-    // If there are no RT CPUs, but all the BK ones were claimed
-    if ( best_rt == nr_cpus ) 
-    {
-        best_rt = best_bk;
-    }
-
-    // Fall back to RT, with claim + hint tie-break.
-    if (best_rt != nr_cpus) {
-        if (hint_ok && hint_cls == CPU_RT && hint_load == best_rt_load) 
-        {
-            set_flags_from_cls(hint_cls, is_idle, can_kick);
-            return hint_cpu;
-        } else {
-            set_flags_from_cls(CPU_RT, is_idle, can_kick);
-            return best_rt;
-        }
-    }
+    cpu = scan_rt_cpus(&scan, is_idle, can_kick);
+    if (cpu < n)
+        return cpu;
 
     log("pick_cpu_to_kick_for_rt: FOUND NOTHING for pid %d", 2, p->pid);
 
