@@ -5,6 +5,22 @@
 #define DEBUG 0
 #endif
 
+/*
+ * Per-map operation timing (lookup/update/delete/atomic/...). Callback
+ * timing is independent. Leave undefined or 0 to compile it out.
+ */
+#ifndef MAP_OP_STATS
+#define MAP_OP_STATS 1
+#endif
+
+/*
+ * Per-callback timing (select_cpu/enqueue/dispatch/...). Map operation
+ * timing is independent. Leave undefined or 0 to compile it out.
+ */
+#ifndef CALLBACK_STATS
+#define CALLBACK_STATS 0
+#endif
+
 enum {
 	HWEIGHT_ONE		= 1LLU << 16,
 };
@@ -67,9 +83,12 @@ enum callback_idx {
 	CALLBACK_NR,
 };
 
+#define TIMING_HIST_BUCKETS 64
+
 struct callback_timing {
 	__u64 total_ns;
 	__u64 count;
+	__u64 latency_hist[TIMING_HIST_BUCKETS];
 };
 
 enum map_idx {
@@ -87,11 +106,30 @@ enum map_idx {
 	MAP_NR,
 };
 
+/*
+ * How a map value is shared across CPUs, not whether the map object is shared.
+ *
+ * per_cpu_value:  physically separate value for each CPU
+ * cpu_indexed:    shared map, keyed by CPU; each CPU normally uses its own slot
+ * task_local:     storage associated with one task
+ * cgroup_shared:  tasks in the same cgroup access the same value
+ * global_shared:  all CPUs may access the same entry
+ */
+enum map_value_scope {
+	MAP_SCOPE_PER_CPU_VALUE,
+	MAP_SCOPE_CPU_INDEXED,
+	MAP_SCOPE_TASK_LOCAL,
+	MAP_SCOPE_CGROUP_SHARED,
+	MAP_SCOPE_GLOBAL_SHARED,
+};
+
 enum map_op_idx {
 	MAP_OP_LOOKUP,
 	MAP_OP_UPDATE,
 	MAP_OP_DELETE,
 	MAP_OP_STORAGE_GET,
+	MAP_OP_ATOMIC,
+	MAP_OP_FOREACH,
 
 	MAP_OP_NR,
 };
@@ -101,6 +139,7 @@ struct map_timing {
 	__u64 count;
 	__u64 max_ns;
 	__u64 slow_count;
+	__u64 latency_hist[TIMING_HIST_BUCKETS];
 };
 
 #define MAP_SLOW_OP_NS 1000

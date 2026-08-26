@@ -31,6 +31,34 @@ u64 fallback_vtime_now;
 
 UEI_DEFINE(uei);
 
+u64 rt_task_nr;
+u64 timing_started_ns;
+u64 timing_ended_ns;
+u8 timing_on;
+
+static __always_inline void rt_task_join(void)
+{
+    if (__sync_fetch_and_add(&rt_task_nr, 1) == 0) {
+        timing_started_ns = bpf_ktime_get_ns();
+        timing_on = 1;
+    }
+}
+
+static __always_inline void rt_task_leave(void)
+{
+    u64 old = __sync_fetch_and_sub(&rt_task_nr, 1);
+
+    if (old == 0) {
+        __sync_fetch_and_add(&rt_task_nr, 1);
+        return;
+    }
+
+    if (old == 1) {
+        timing_ended_ns = bpf_ktime_get_ns();
+        scx_bpf_exit(0, "no remaining RT tasks");
+    }
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
@@ -38,8 +66,27 @@ struct {
     __uint(max_entries, STAT_NR);
 } stats SEC(".maps");
 
+#if CALLBACK_STATS
 struct callback_timing callback_timing_stats[CALLBACK_NR];
+#endif
 
+#if CALLBACK_STATS || MAP_OP_STATS
+static __always_inline u32 timing_hist_bucket(u64 elapsed)
+{
+    u32 bucket = elapsed ? 63 - __builtin_clzll(elapsed) : 0;
+
+    /*
+     * LLVM's BPF lowering of clz doesn't preserve the logical 0..63 range
+     * for the verifier. The compiler barrier prevents LLVM from folding the
+     * mask back into that lowering, leaving an explicit verifier-visible
+     * bound before the array access.
+     */
+    asm volatile("" : "+r"(bucket));
+    return bucket & (TIMING_HIST_BUCKETS - 1);
+}
+#endif
+
+#if CALLBACK_STATS
 static __always_inline u64 callback_timer_start(void)
 {
     return bpf_ktime_get_ns();
@@ -48,24 +95,49 @@ static __always_inline u64 callback_timer_start(void)
 static __always_inline void callback_timer_record(enum callback_idx callback,
                                                    u64 started_at)
 {
+    if (!timing_on || !started_at)
+        return;
+
     u64 elapsed = bpf_ktime_get_ns() - started_at;
+    u32 bucket = timing_hist_bucket(elapsed);
 
     __sync_fetch_and_add(&callback_timing_stats[callback].total_ns, elapsed);
     __sync_fetch_and_add(&callback_timing_stats[callback].count, 1);
+    __sync_fetch_and_add(
+        &callback_timing_stats[callback].latency_hist[bucket], 1);
+}
+#else
+static __always_inline u64 callback_timer_start(void)
+{
+    return 0;
 }
 
+static __always_inline void callback_timer_record(enum callback_idx callback,
+                                                   u64 started_at)
+{
+    (void)callback;
+    (void)started_at;
+}
+#endif
+
+#if MAP_OP_STATS
 struct map_timing map_timing_stats[MAP_NR][MAP_OP_NR];
 
 static __always_inline void map_timer_record(enum map_idx map,
                                              enum map_op_idx op,
                                              u64 started_at)
 {
+    if (!timing_on || !started_at)
+        return;
+
     struct map_timing *timing = &map_timing_stats[map][op];
     u64 elapsed = bpf_ktime_get_ns() - started_at;
+    u32 bucket = timing_hist_bucket(elapsed);
     u64 old_max = __sync_fetch_and_add(&timing->max_ns, 0);
 
     __sync_fetch_and_add(&timing->total_ns, elapsed);
     __sync_fetch_and_add(&timing->count, 1);
+    __sync_fetch_and_add(&timing->latency_hist[bucket], 1);
     if (elapsed >= MAP_SLOW_OP_NS)
         __sync_fetch_and_add(&timing->slow_count, 1);
 
@@ -94,6 +166,13 @@ static __always_inline void map_timer_record(enum map_idx map,
     __ret;                                                                 \
 })
 
+#define map_for_each_elem(map, callback, ctx, flags, map_idx) ({            \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    long __ret = bpf_for_each_map_elem((map), (callback), (ctx), (flags)); \
+    map_timer_record((map_idx), MAP_OP_FOREACH, __started_at);              \
+    __ret;                                                                 \
+})
+
 #define cgrp_storage_get(cgrp, value, flags) ({                             \
     u64 __started_at = bpf_ktime_get_ns();                                 \
     void *__value = bpf_cgrp_storage_get(&cgrp_ctx, (cgrp), (value),        \
@@ -109,6 +188,80 @@ static __always_inline void map_timer_record(enum map_idx map,
     map_timer_record(MAP_TASK_CTX, MAP_OP_STORAGE_GET, __started_at);       \
     __value;                                                               \
 })
+
+#define map_atomic_fetch_add(ptr, value, map_idx) ({                        \
+    typeof(ptr) __ptr = (ptr);                                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    typeof(*__ptr) __ret = __sync_fetch_and_add(__ptr, (value));           \
+    map_timer_record((map_idx), MAP_OP_ATOMIC, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define map_atomic_fetch_sub(ptr, value, map_idx) ({                        \
+    typeof(ptr) __ptr = (ptr);                                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    typeof(*__ptr) __ret = __sync_fetch_and_sub(__ptr, (value));           \
+    map_timer_record((map_idx), MAP_OP_ATOMIC, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define map_atomic_fetch_or(ptr, value, map_idx) ({                         \
+    typeof(ptr) __ptr = (ptr);                                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    typeof(*__ptr) __ret = __sync_fetch_and_or(__ptr, (value));            \
+    map_timer_record((map_idx), MAP_OP_ATOMIC, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define map_atomic_sub_fetch(ptr, value, map_idx) ({                        \
+    typeof(ptr) __ptr = (ptr);                                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    typeof(*__ptr) __ret = __sync_sub_and_fetch(__ptr, (value));           \
+    map_timer_record((map_idx), MAP_OP_ATOMIC, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define map_atomic_cmpxchg(ptr, old, value, map_idx) ({                     \
+    typeof(ptr) __ptr = (ptr);                                             \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    typeof(*__ptr) __ret = __sync_val_compare_and_swap(                    \
+        __ptr, (old), (value));                                            \
+    map_timer_record((map_idx), MAP_OP_ATOMIC, __started_at);               \
+    __ret;                                                                 \
+})
+
+#define map_kptr_xchg(ptr, value, map_idx) ({                               \
+    u64 __started_at = bpf_ktime_get_ns();                                 \
+    typeof(*(ptr)) __ret = bpf_kptr_xchg((ptr), (value));                  \
+    map_timer_record((map_idx), MAP_OP_ATOMIC, __started_at);               \
+    __ret;                                                                 \
+})
+#else
+#define map_lookup_elem(map, key, map_idx) \
+    bpf_map_lookup_elem((map), (key))
+#define map_update_elem(map, key, value, flags, map_idx) \
+    bpf_map_update_elem((map), (key), (value), (flags))
+#define map_delete_elem(map, key, map_idx) \
+    bpf_map_delete_elem((map), (key))
+#define map_for_each_elem(map, callback, ctx, flags, map_idx) \
+    bpf_for_each_map_elem((map), (callback), (ctx), (flags))
+#define cgrp_storage_get(cgrp, value, flags) \
+    bpf_cgrp_storage_get(&cgrp_ctx, (cgrp), (value), (flags))
+#define task_storage_get(task, value, flags) \
+    bpf_task_storage_get(&task_ctx, (task), (value), (flags))
+#define map_atomic_fetch_add(ptr, value, map_idx) \
+    __sync_fetch_and_add((ptr), (value))
+#define map_atomic_fetch_sub(ptr, value, map_idx) \
+    __sync_fetch_and_sub((ptr), (value))
+#define map_atomic_fetch_or(ptr, value, map_idx) \
+    __sync_fetch_and_or((ptr), (value))
+#define map_atomic_sub_fetch(ptr, value, map_idx) \
+    __sync_sub_and_fetch((ptr), (value))
+#define map_atomic_cmpxchg(ptr, old, value, map_idx) \
+    __sync_val_compare_and_swap((ptr), (old), (value))
+#define map_kptr_xchg(ptr, value, map_idx) \
+    bpf_kptr_xchg((ptr), (value))
+#endif
 
 static void stat_inc(enum stat_idx idx)
 {
@@ -223,9 +376,9 @@ static __always_inline void cls_inc(u32 is_rt)
     struct cls_counters *c = map_lookup_elem(&cls_cnts, &k, MAP_CLS_CNTS);
     if (!c) return;
     if (is_rt) 
-        __sync_fetch_and_add(&c->rt, 1);   // lowers to BPF_XADD
+        map_atomic_fetch_add(&c->rt, 1, MAP_CLS_CNTS);
     else
-        __sync_fetch_and_add(&c->bk, 1);
+        map_atomic_fetch_add(&c->bk, 1, MAP_CLS_CNTS);
 }
 
 static __always_inline void cls_dec(u32 is_rt)
@@ -234,9 +387,9 @@ static __always_inline void cls_dec(u32 is_rt)
     struct cls_counters *c = map_lookup_elem(&cls_cnts, &k, MAP_CLS_CNTS);
     if (!c) return;
     if (is_rt)
-        __sync_fetch_and_sub(&c->rt, 1);
+        map_atomic_fetch_sub(&c->rt, 1, MAP_CLS_CNTS);
     else
-        __sync_fetch_and_sub(&c->bk, 1);
+        map_atomic_fetch_sub(&c->bk, 1, MAP_CLS_CNTS);
 }
 
 static __always_inline u64 cls_get_rt(void)
@@ -258,9 +411,9 @@ static __always_inline bool increment_enq_count( struct task_ctx *taskc, struct 
     if (!taskc || !cgc) return false;
 
     // Win once per residency: 0 -> cgid
-    if (__sync_val_compare_and_swap(&taskc->enq_cgid, 0, cgid) == 0) 
+    if (map_atomic_cmpxchg(&taskc->enq_cgid, 0, cgid, MAP_TASK_CTX) == 0)
     {
-        u64 old = __sync_fetch_and_add(&cgc->enq_count, 1);
+        u64 old = map_atomic_fetch_add(&cgc->enq_count, 1, MAP_CGRP_CTX);
     
         if ( 0 == old )
         {
@@ -280,7 +433,8 @@ static __always_inline void decrement_enq_count( struct task_ctx *taskc, struct 
     u64 task_cgid = taskc->enq_cgid;
 
     // Win once per residency: cgid -> 0
-    u64 enq_cgid = __sync_val_compare_and_swap(&taskc->enq_cgid, task_cgid, 0);
+    u64 enq_cgid = map_atomic_cmpxchg(&taskc->enq_cgid, task_cgid, 0,
+                                     MAP_TASK_CTX);
 
     if ( 0 != enq_cgid && enq_cgid == task_cgid ) 
     {
@@ -298,7 +452,8 @@ static __always_inline void decrement_enq_count( struct task_ctx *taskc, struct 
 
         if ( cgc )
         {
-            u64 old = __sync_fetch_and_sub(&cgc->enq_count, 1);
+            u64 old = map_atomic_fetch_sub(&cgc->enq_count, 1,
+                                           MAP_CGRP_CTX);
             
             if ( 1 == old )
             {
@@ -318,19 +473,19 @@ static __always_inline void cnt_inc(struct cpu_ctx *cpuc, u32 cpu, s32 pid, bool
 {
     if (!cpuc) return;
     if (is_rt) {
-        __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+        map_atomic_fetch_add(&cpuc->rt_cnt, 1, MAP_CPU_CTX);
         #if RT_ACTIVE_CHECK
         cpuc->rt_active = 1;
         #endif
     }
-    else       __sync_fetch_and_add(&cpuc->bk_cnt, 1);
+    else       map_atomic_fetch_add(&cpuc->bk_cnt, 1, MAP_CPU_CTX);
 }
 
 static __always_inline void cnt_inc_pending(struct cpu_ctx *cpuc, u32 cpu)
 {
     if (!cpuc) return;
     
-    __sync_fetch_and_add(&cpuc->bk_cnt_pending, 1);
+    map_atomic_fetch_add(&cpuc->bk_cnt_pending, 1, MAP_CPU_CTX);
 }
 
 static __always_inline void cnt_dec_pending(struct cpu_ctx *cpuc, u32 cpu, s32 pid, u64 cgid)
@@ -341,11 +496,11 @@ static __always_inline void cnt_dec_pending(struct cpu_ctx *cpuc, u32 cpu, s32 p
     }
 
     // atomic decrement; returns previous value
-    u64 old = __sync_fetch_and_sub(&cpuc->bk_cnt_pending, 1);
+    u64 old = map_atomic_fetch_sub(&cpuc->bk_cnt_pending, 1, MAP_CPU_CTX);
 
     if (old == 0) {
         log("\tcnt_dec_pending: ERROR, cnt PENDING underflow on cpu %u", 0, cpu);
-        __sync_fetch_and_add(&cpuc->bk_cnt_pending, 1);
+        map_atomic_fetch_add(&cpuc->bk_cnt_pending, 1, MAP_CPU_CTX);
     }
 }
 
@@ -359,7 +514,7 @@ static __always_inline void cnt_dec(struct cpu_ctx *cpuc, bool is_rt, u32 cpu, s
     u64 *cnt_ptr = is_rt ? &cpuc->rt_cnt : &cpuc->bk_cnt;
 
     // atomic decrement; returns previous value
-    u64 old = __sync_fetch_and_sub(cnt_ptr, 1);
+    u64 old = map_atomic_fetch_sub(cnt_ptr, 1, MAP_CPU_CTX);
 
     if (old == 0) {
         log("\tcnt_dec: ERROR, cnt underflow on cpu %u for pid %d", is_rt, cpu, pid);
@@ -382,15 +537,17 @@ static __always_inline enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
     struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc) return CPU_BK; // conservative
 
-    if (__sync_fetch_and_add(&cpuc->rt_cnt, 0) )
+    if (map_atomic_fetch_add(&cpuc->rt_cnt, 0, MAP_CPU_CTX))
         return CPU_RT;
 
-    u32 claim_pid = __sync_fetch_and_add(&cpuc->rt_claim_pid, 0);
+    u32 claim_pid = map_atomic_fetch_add(&cpuc->rt_claim_pid, 0,
+                                         MAP_CPU_CTX);
 
     if ( claim_pid != 0 && claim_pid != pid )
         return CPU_RT;
 
-    if (__sync_fetch_and_add(&cpuc->bk_cnt, 0) || __sync_fetch_and_add(&cpuc->bk_cnt_pending, 0))
+    if (map_atomic_fetch_add(&cpuc->bk_cnt, 0, MAP_CPU_CTX) ||
+        map_atomic_fetch_add(&cpuc->bk_cnt_pending, 0, MAP_CPU_CTX))
         return CPU_BK;
     return CPU_IDLING;
 }
@@ -438,7 +595,7 @@ static __always_inline void mask_set_cpu(struct cpuset_bits *st, __u32 cpu) {
     __u64 new_bit = (1ull << bit);
     __u64 *slot = &st->mask[w];
 
-    __sync_fetch_and_or(slot, new_bit);
+    map_atomic_fetch_or(slot, new_bit, MAP_CPUSET);
 }
 
 static __always_inline bool mask_test_cpu(struct cpuset_bits *st, __u32 cpu) 
@@ -450,7 +607,7 @@ static __always_inline bool mask_test_cpu(struct cpuset_bits *st, __u32 cpu)
         return false;
 
     __u64 *slot = &st->mask[w];
-    __u64 word = __sync_fetch_and_add(slot, 0); // atomic read
+    __u64 word = map_atomic_fetch_add(slot, 0, MAP_CPUSET);
 
     return (word >> bit) & 1ull;
 }
@@ -499,7 +656,7 @@ static __always_inline u64 rt_assigned_count(u32 cpu)
     if (!cpuc)
         return ~0ULL;
 
-    return __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 0);
+    return map_atomic_fetch_add(&cpuc->rt_assigned_cnt, 0, MAP_CPU_CTX);
 }
 
 static __always_inline void rt_assigned_count_inc(u32 cpu)
@@ -511,7 +668,7 @@ static __always_inline void rt_assigned_count_inc(u32 cpu)
 
     cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (cpuc)
-        __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 1);
+        map_atomic_fetch_add(&cpuc->rt_assigned_cnt, 1, MAP_CPU_CTX);
 }
 
 static __always_inline void rt_assigned_count_dec(u32 cpu)
@@ -526,9 +683,9 @@ static __always_inline void rt_assigned_count_dec(u32 cpu)
     if (!cpuc)
         return;
 
-    old = __sync_fetch_and_sub(&cpuc->rt_assigned_cnt, 1);
+    old = map_atomic_fetch_sub(&cpuc->rt_assigned_cnt, 1, MAP_CPU_CTX);
     if (!old) {
-        __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 1);
+        map_atomic_fetch_add(&cpuc->rt_assigned_cnt, 1, MAP_CPU_CTX);
         log("\trt_assigned_count_dec: underflow on CPU %u", 1, cpu);
     }
 }
@@ -559,7 +716,8 @@ static long least_assigned_cpu_cb(u32 cpu, void *data)
         return 0;
 
     cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
-    u64 count = cpuc ? __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 0) : ~0ULL;
+    u64 count = cpuc ? map_atomic_fetch_add(&cpuc->rt_assigned_cnt, 0,
+                                            MAP_CPU_CTX) : ~0ULL;
 
     if (count < ctx->best_count) {
         ctx->best_count = count;
@@ -670,7 +828,8 @@ static __attribute__((noinline)) void balance_rt_assignments(void)
     for (u32 move = 0; move < RT_BALANCE_MAX_MOVES; move++) {
         struct rt_balance_ctx ctx = {};
 
-        bpf_for_each_map_elem(&rt_task_assignments, balance_rt_assignment_cb, &ctx, 0);
+        map_for_each_elem(&rt_task_assignments, balance_rt_assignment_cb,
+                          &ctx, 0, MAP_RT_TASK_ASSIGNMENTS);
         if (!ctx.moved)
             goto out;
     }
@@ -738,7 +897,8 @@ static __always_inline void dump_cgroup_tasks( u32 pid, u64 cgid, u64 vtime )
 
     log("TASK_VTIME_DUMP_BEGIN cgid=%llu", 0, cgid);
 
-    bpf_for_each_map_elem(&task_vtime_map, dump_cgroup_task_cb, &ctx, 0);
+    map_for_each_elem(&task_vtime_map, dump_cgroup_task_cb, &ctx, 0,
+                      MAP_TASK_VTIME);
 
     log("TASK_VTIME_DUMP_END cgid=%llu", 0, cgid);
 }
@@ -845,15 +1005,16 @@ static void cgrp_enqueue_stat( struct cgroup *cgrp, struct cgrp_ctx* cgc, s32 pi
         cg_stat->rt_class = is_cgroup_rt( cgrp );
     }
 
-    __sync_fetch_and_add( &cg_stat->enq_cnt, 1 );
+    map_atomic_fetch_add(&cg_stat->enq_cnt, 1, MAP_CGRP_STATS);
 
     // Read atomically
-    if ( 0 == __sync_fetch_and_add( &cg_stat->first_enq_ts, 0) )
+    if (0 == map_atomic_fetch_add(&cg_stat->first_enq_ts, 0,
+                                  MAP_CGRP_STATS))
     {
         //__u64 ts = scx_bpf_now();
         __u64 ts = bpf_ktime_get_ns();
 
-        __sync_val_compare_and_swap( &cg_stat->first_enq_ts, 0, ts );
+        map_atomic_cmpxchg(&cg_stat->first_enq_ts, 0, ts, MAP_CGRP_STATS);
         log("\tcgrp_enqueue_stat: setting first_enq_ts = %llu for pid %d", cgc->rt_class, ts, pid);
     }
 #endif
@@ -870,11 +1031,13 @@ static void cgrp_dispatch_stat( __u64 cgid, struct cgrp_ctx* cgc, struct cpu_ctx
     if (!cg_stat) return;
 
     // Read atomically
-    __u64 ts = __sync_fetch_and_add( &cg_stat->first_enq_ts, 0 );
+    __u64 ts = map_atomic_fetch_add(&cg_stat->first_enq_ts, 0,
+                                    MAP_CGRP_STATS);
     if ( ts == 0 ) return; // Not armed
 
     // Win the race to clear to 0
-    if (__sync_val_compare_and_swap( &cg_stat->first_enq_ts, ts, 0 ) != ts )
+    if (map_atomic_cmpxchg(&cg_stat->first_enq_ts, ts, 0,
+                           MAP_CGRP_STATS) != ts)
         return; // Someone else recorded
 
 
@@ -887,10 +1050,12 @@ static void cgrp_dispatch_stat( __u64 cgid, struct cgrp_ctx* cgc, struct cpu_ctx
 
     log("\tcgrp_dispatch_stat: ts = %llu, now = %llu, bumping count", cgc->rt_class, ts, now);
 
-    __sync_fetch_and_add( &cg_stat->lat_sum_ns, lat );
-    __u64 lat_cnt = __sync_fetch_and_add( &cg_stat->lat_cnt, 1 );
+    map_atomic_fetch_add(&cg_stat->lat_sum_ns, lat, MAP_CGRP_STATS);
+    __u64 lat_cnt = map_atomic_fetch_add(&cg_stat->lat_cnt, 1,
+                                         MAP_CGRP_STATS);
 
-    __u64 lat_max = __sync_fetch_and_add( &cg_stat->lat_max, 0 );
+    __u64 lat_max = map_atomic_fetch_add(&cg_stat->lat_max, 0,
+                                         MAP_CGRP_STATS);
 
     // No floating point types in BPF code
     __u64 lat_ms_int = lat / 1000000;
@@ -901,13 +1066,14 @@ static void cgrp_dispatch_stat( __u64 cgid, struct cgrp_ctx* cgc, struct cpu_ctx
         if ( cgc->rt_class )
             log("\tcgrp_dispatch_stat: lat = %llu.%llu ms (rt_class = %d), NEW MAX!", cgc->rt_class, lat_ms_int, lat_ms_frac, cgc->rt_class);
 
-        __sync_val_compare_and_swap( &cg_stat->lat_max, lat_max, lat );
+        map_atomic_cmpxchg(&cg_stat->lat_max, lat_max, lat,
+                           MAP_CGRP_STATS);
     }
 
     // Prep dispatch-running stats
     if ( cpuc->first_move_ts == 0 )
     {
-        __sync_fetch_and_add( &cpuc->first_move_ts, now );
+        map_atomic_fetch_add(&cpuc->first_move_ts, now, MAP_CPU_CTX);
     }
 
 #endif
@@ -923,18 +1089,18 @@ static void cgrp_running_stat( __u64 cgid, struct cgrp_ctx* cgc, struct cpu_ctx 
     if (!cg_stat) return;
 
     // Read atomically
-    u64 ts = __sync_fetch_and_add( &cpuc->first_move_ts, 0 );
+    u64 ts = map_atomic_fetch_add(&cpuc->first_move_ts, 0, MAP_CPU_CTX);
     if ( ts == 0 ) return; // Not armed
 
     // Win the race to clear to 0
-    if (__sync_val_compare_and_swap( &cpuc->first_move_ts, ts, 0 ) != ts )
+    if (map_atomic_cmpxchg(&cpuc->first_move_ts, ts, 0, MAP_CPU_CTX) != ts)
         return; // Someone else recorded
 
     u64 lat = scx_bpf_now() - ts;
 
     // Increment the CGRP stats with the CPU stats
-    __sync_fetch_and_add( &cg_stat->move_lat_sum_ns, lat );
-    __sync_fetch_and_add( &cg_stat->move_lat_cnt, 1 );
+    map_atomic_fetch_add(&cg_stat->move_lat_sum_ns, lat, MAP_CGRP_STATS);
+    map_atomic_fetch_add(&cg_stat->move_lat_cnt, 1, MAP_CGRP_STATS);
 
 #endif
 }
@@ -954,9 +1120,9 @@ task_enqueue_stat(struct task_struct *p, struct task_ctx *taskc, u64 cgid, bool 
     if (!cg_stat)
         return;
 
-    if (__sync_fetch_and_add(&taskc->first_enq_ts, 0) == 0) {
+    if (map_atomic_fetch_add(&taskc->first_enq_ts, 0, MAP_TASK_CTX) == 0) {
         u64 ts = bpf_ktime_get_ns();
-        __sync_val_compare_and_swap(&taskc->first_enq_ts, 0, ts);
+        map_atomic_cmpxchg(&taskc->first_enq_ts, 0, ts, MAP_TASK_CTX);
 
         if (is_idle)
         {
@@ -983,12 +1149,13 @@ task_running_stat(struct task_struct *p, struct task_ctx *taskc,
         return;
 
     // Read armed ts from the task
-    u64 ts = __sync_fetch_and_add(&taskc->first_enq_ts, 0);
+    u64 ts = map_atomic_fetch_add(&taskc->first_enq_ts, 0, MAP_TASK_CTX);
     if (ts == 0)
         return;
 
     // Win race to consume it once
-    if (__sync_val_compare_and_swap(&taskc->first_enq_ts, ts, 0) != ts)
+    if (map_atomic_cmpxchg(&taskc->first_enq_ts, ts, 0,
+                           MAP_TASK_CTX) != ts)
         return;
 
     u64 now = bpf_ktime_get_ns();
@@ -1026,9 +1193,9 @@ task_running_stat(struct task_struct *p, struct task_ctx *taskc,
         enq_sum_ns = &cg_stat->enq_rt_sum_ns;
     }
 
-    __sync_fetch_and_add(enq_sum_ns, lat);
-    u64 lat_cnt = __sync_fetch_and_add(enq_cnt, 1);
-    u64 lat_max = __sync_fetch_and_add(enq_max, 0);
+    map_atomic_fetch_add(enq_sum_ns, lat, MAP_CGRP_STATS);
+    u64 lat_cnt = map_atomic_fetch_add(enq_cnt, 1, MAP_CGRP_STATS);
+    u64 lat_max = map_atomic_fetch_add(enq_max, 0, MAP_CGRP_STATS);
 
     if (lat_cnt > 100 && (lat > lat_max || (lat / 10000) >= 1 )) {
         u64 lat_ms_int  = lat / 1000000;
@@ -1036,7 +1203,7 @@ task_running_stat(struct task_struct *p, struct task_ctx *taskc,
 
         log("\t\ttask_running_stat: NEW MAX %u with lat = %llu.%llu ms for pid %d (ts=%llu),", cgc->rt_class, taskc->rt_enq_bucket, lat_ms_int, lat_ms_frac, p->pid, ts);
 
-        __sync_val_compare_and_swap(enq_max, lat_max, lat);
+        map_atomic_cmpxchg(enq_max, lat_max, lat, MAP_CGRP_STATS);
     }
 #endif
 }
@@ -1242,6 +1409,11 @@ static void cgrp_cap_budget(struct cgv_node *cgv_node, struct cgrp_ctx *cgc)
     * and thus can't be updated and repositioned. Instead, we collect the
     * vtime deltas separately and apply it asynchronously here.
     */
+    /*
+     * This function is called with cgv_tree_lock held. BPF helpers,
+     * including the clock helper used by map_atomic_fetch_sub(), are not
+     * allowed in that context, so this locked atomic cannot be timed.
+     */
     delta = __sync_fetch_and_sub(&cgc->cvtime_delta, cgc->cvtime_delta);
     cvtime = cgv_node->cvtime + delta;
 
@@ -1276,9 +1448,9 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
     }
 
     /* paired with cmpxchg in try_pick_next_cgroup() */
-    if (__sync_val_compare_and_swap(&cgc->queued, 0, 1)) {
+    if (map_atomic_cmpxchg(&cgc->queued, 0, 1, MAP_CGRP_CTX)) {
 
-        cgv_node = bpf_kptr_xchg(&stash->node, NULL);
+        cgv_node = map_kptr_xchg(&stash->node, NULL, MAP_CGV_NODE_STASH);
         if (!cgv_node) {
 #if DEBUG
             log("\tcgrp_enqueued: skip because cgc->queued == 1 for cgid %llu (%s)", cgc->rt_class, cgid, cg_name_buf);
@@ -1290,7 +1462,7 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
     else
     {
         /* NULL if the node is already on the rbtree */
-        cgv_node = bpf_kptr_xchg(&stash->node, NULL);
+        cgv_node = map_kptr_xchg(&stash->node, NULL, MAP_CGV_NODE_STASH);
     }
 
     if (!cgv_node) 
@@ -1505,11 +1677,13 @@ static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid, bool is_idle)
     struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cpu, MAP_CPU_CTX);
     if (!cpuc) return false;
 
-    if (is_idle && __sync_fetch_and_add(&cpuc->bk_cnt_pending, 0))
+    if (is_idle &&
+        map_atomic_fetch_add(&cpuc->bk_cnt_pending, 0, MAP_CPU_CTX))
         return false;
 
     // Winner takes CPU. Loser must pick another CPU.
-    bool val = __sync_val_compare_and_swap(&cpuc->rt_claim_pid, 0, pid) == 0;
+    bool val = map_atomic_cmpxchg(&cpuc->rt_claim_pid, 0, pid,
+                                  MAP_CPU_CTX) == 0;
 
     if ( !val )
     {
@@ -1530,7 +1704,8 @@ static __always_inline void rt_clear_claim(u32 cpu, u32 pid)
     if (cpuc) 
     {
         // Clear only if this task owns the claim
-        u32 prev_pid = __sync_val_compare_and_swap(&cpuc->rt_claim_pid, pid, 0);
+        u32 prev_pid = map_atomic_cmpxchg(&cpuc->rt_claim_pid, pid, 0,
+                                          MAP_CPU_CTX);
     }
 }
 
@@ -1540,8 +1715,8 @@ static __always_inline u32 cpu_load_for_pick(u32 cpu)
 
     if ( !cpuc ) return 0;
 
-    u64 num_bk = __sync_fetch_and_add(&cpuc->bk_cnt, 0);
-    u64 num_rt = __sync_fetch_and_add(&cpuc->rt_cnt, 0);
+    u64 num_bk = map_atomic_fetch_add(&cpuc->bk_cnt, 0, MAP_CPU_CTX);
+    u64 num_rt = map_atomic_fetch_add(&cpuc->rt_cnt, 0, MAP_CPU_CTX);
 
     return (u32) ( num_bk + num_rt );
 }
@@ -1802,7 +1977,8 @@ static s32 select_cpu_impl(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
                 if ( !is_idle && !can_kick )
                 {
                     // Determine if task should be enqueued at head or not
-                    u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
+                    u64 now_v = map_atomic_fetch_add(&tgtc->rt_vtime_now, 0,
+                                                     MAP_CPU_CTX);
                     u64 tv    = p->scx.dsq_vtime;
     
                     s64 d = time_delta(now_v, tv);   // signed
@@ -1949,7 +2125,8 @@ static void enqueue_impl(struct task_struct *p, u64 enq_flags)
             if ( !is_idle && !can_kick )
             {
                 // Determine if task should be enqueued at head or not
-                u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
+                u64 now_v = map_atomic_fetch_add(&tgtc->rt_vtime_now, 0,
+                                                 MAP_CPU_CTX);
                 u64 tv    = p->scx.dsq_vtime;
 
                 s64 d = time_delta(now_v, tv);   // signed
@@ -2099,11 +2276,11 @@ static void update_active_weight_sums(struct cgroup *cgrp, bool runnable)
     * repeatedly for a busy cgroup which is staying active.
     */
     if (runnable) {
-        if (__sync_fetch_and_add(&cgc->nr_runnable, 1))
+        if (map_atomic_fetch_add(&cgc->nr_runnable, 1, MAP_CGRP_CTX))
             return;
         stat_inc(STAT_ACT);
     } else {
-        if (__sync_sub_and_fetch(&cgc->nr_runnable, 1))
+        if (map_atomic_sub_fetch(&cgc->nr_runnable, 1, MAP_CGRP_CTX))
             return;
         stat_inc(STAT_DEACT);
     }
@@ -2316,16 +2493,18 @@ static void stopping_impl(struct task_struct *p, bool runnable)
     if ( cpuc && cgc && cgc->rt_class )
     {
         u64 v = p->scx.dsq_vtime;
-        u64 cur = __sync_fetch_and_add(&cpuc->rt_vtime_now, 0);
+        u64 cur = map_atomic_fetch_add(&cpuc->rt_vtime_now, 0,
+                                       MAP_CPU_CTX);
         if (time_before(cur, v))
-            __sync_val_compare_and_swap(&cpuc->rt_vtime_now, cur, v);
+            map_atomic_cmpxchg(&cpuc->rt_vtime_now, cur, v, MAP_CPU_CTX);
     }
 #endif
 
 	if (cgc && taskc->bypassed_at)
     {
-		__sync_fetch_and_add(&cgc->cvtime_delta,
-				     p->se.sum_exec_runtime - taskc->bypassed_at);
+		map_atomic_fetch_add(&cgc->cvtime_delta,
+				     p->se.sum_exec_runtime - taskc->bypassed_at,
+				     MAP_CGRP_CTX);
 		taskc->bypassed_at = 0;
 	}
 
@@ -2457,19 +2636,23 @@ inline static void try_stash_node( u64 cgid, struct cgrp_ctx *cgc, struct bpf_rb
 
     if ( stash )
     {
-        __sync_val_compare_and_swap( &cgc->queued, 1, 0 );
+        map_atomic_cmpxchg(&cgc->queued, 1, 0, MAP_CGRP_CTX);
 
-        cgv_node = bpf_kptr_xchg(&stash->node, cgv_node);
+        cgv_node = map_kptr_xchg(&stash->node, cgv_node,
+                                 MAP_CGV_NODE_STASH);
         log("\tdispatch: STASHING node for cgid %llu on cpu %d", cgc->rt_class, cgid, cpu );
 
-        u64 enq_count =__sync_fetch_and_add( &cgc->enq_count, 0 );
+        u64 enq_count = map_atomic_fetch_add(&cgc->enq_count, 0,
+                                             MAP_CGRP_CTX);
         u32 qsz  = scx_bpf_dsq_nr_queued( cgid );
 
-        if ( ( enq_count > 0 || qsz > 0 ) && 0 == __sync_val_compare_and_swap( &cgc->queued, 0, 1 ) ) // Race condition with enqueue, we must undo the stash!
+        if ((enq_count > 0 || qsz > 0) &&
+            0 == map_atomic_cmpxchg(&cgc->queued, 0, 1, MAP_CGRP_CTX))
         {
             log("\tdispatch: RACE-CONDITION with enqueue, undoing STASH cgid %llu on cpu %d (qsz=%u)", cgc->rt_class, cgid, cpu, qsz);
 
-            struct cgv_node *back = bpf_kptr_xchg(&stash->node, NULL);
+            struct cgv_node *back = map_kptr_xchg(
+                &stash->node, NULL, MAP_CGV_NODE_STASH);
             if ( back )
             {
                 bpf_spin_lock( &cgv_tree_lock );
@@ -2573,7 +2756,8 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         return true;
     }
 
-    u64 enq_count =__sync_fetch_and_add(&cgc->enq_count, 0);
+    u64 enq_count = map_atomic_fetch_add(&cgc->enq_count, 0,
+                                         MAP_CGRP_CTX);
 
     if (scx_bpf_dsq_move_to_local(cgid))
     {
@@ -2760,6 +2944,10 @@ static void dispatch_impl(s32 cpu, struct task_struct *prev)
     cgc = cgrp_storage_get(cgrp, 0, 0);
     if (cgc) {
 		bpf_spin_lock(&cgv_tree_lock);
+		/*
+		 * Clock helpers are forbidden while cgv_tree_lock is held.
+		 * Keep this atomic uninstrumented for verifier compatibility.
+		 */
 		__sync_fetch_and_add(&cgc->cvtime_delta,
 				     (cpuc->cur_bk_at + cgrp_slice_ns - now) *
 				     HWEIGHT_ONE / (cgc->hweight ?: 1));
@@ -2865,6 +3053,7 @@ static s32 init_task_impl(struct task_struct *p,
 
     if (cgc->rt_class)
     {
+        rt_task_join();
         taskc->rt_cpu = assign_rt_cpu(p, args->cgroup, taskc, true);
         log("\tinit_task: RT task %d allocated to CPU %u", 1, p->pid, taskc->rt_cpu);
     }
@@ -2931,7 +3120,8 @@ static int cgroup_init_impl(struct cgroup *cgrp,
 
     log("\tcgroup_init: setting the stash to NON-NULL for cgroup %llu (weight=%llu)!!!", cgc->rt_class, cgid, args->weight);
 
-    cgv_node = bpf_kptr_xchg(&stash->node, cgv_node);
+    cgv_node = map_kptr_xchg(&stash->node, cgv_node,
+                             MAP_CGV_NODE_STASH);
     if (cgv_node) {
         scx_bpf_error("unexpected !NULL cgv_node stash");
         ret = -EBUSY;
@@ -2983,11 +3173,15 @@ static void cgroup_move_impl(struct task_struct *p,
 
     if (to_cgc->rt_class)
     {
+        if (!from_cgc->rt_class)
+            rt_task_join();
         taskc->rt_cpu = assign_rt_cpu(p, to, taskc, true);
         log("\tcgroup_move: RT task %d allocated to CPU %u", 2, p->pid, taskc->rt_cpu);
     }
     else if (from_cgc->rt_class || taskc->rt_cpu < nr_cpus)
     {
+        if (from_cgc->rt_class)
+            rt_task_leave();
         release_rt_cpu_assignment(p, taskc);
     }
 
@@ -3042,13 +3236,6 @@ static void exit_task_impl(struct task_struct *p, struct scx_exit_task_args *arg
         release_rt_cpu_assignment(p, taskc);
 
     u32 cur_cpu = taskc->cur_cpu;
-    if ( cur_cpu >= nr_cpus )
-    {
-        return;
-    }
-
-    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cur_cpu, MAP_CPU_CTX);
-    if (!cpuc) return;
 
     cgrp = scx_bpf_task_cgroup(p);
     if ( cgrp )
@@ -3061,7 +3248,16 @@ static void exit_task_impl(struct task_struct *p, struct scx_exit_task_args *arg
     }
     bpf_cgroup_release(cgrp);
 
+    if (rt_class)
+        rt_task_leave();
+
     log("\ttask_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
+
+    if ( cur_cpu >= nr_cpus )
+        return;
+
+    struct cpu_ctx *cpuc = map_lookup_elem(&cpu_ctx, &cur_cpu, MAP_CPU_CTX);
+    if (!cpuc) return;
 
     cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0 );
     #if !PIN_TASKS

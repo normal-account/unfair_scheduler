@@ -53,6 +53,7 @@ static inline double avg_ms(uint64_t sum, uint64_t cnt) { return cnt ? ( (double
 
 static inline double ns_to_ms(uint64_t ns) { return ns ? ( (double)ns / 1e6 ) : 0; }
 
+#if CALLBACK_STATS
 static const char * const callback_names[CALLBACK_NR] = {
 	[CALLBACK_SELECT_CPU] = "select_cpu",
 	[CALLBACK_ENQUEUE] = "enqueue",
@@ -71,7 +72,9 @@ static const char * const callback_names[CALLBACK_NR] = {
 	[CALLBACK_INIT] = "init",
 	[CALLBACK_EXIT] = "exit",
 };
+#endif
 
+#if MAP_OP_STATS
 static const char * const map_names[MAP_NR] = {
 	[MAP_STATS] = "stats",
 	[MAP_CPU_CTX] = "cpu_ctx",
@@ -90,9 +93,77 @@ static const char * const map_op_names[MAP_OP_NR] = {
 	[MAP_OP_UPDATE] = "update",
 	[MAP_OP_DELETE] = "delete",
 	[MAP_OP_STORAGE_GET] = "storage_get",
+	[MAP_OP_ATOMIC] = "atomic",
+	[MAP_OP_FOREACH] = "foreach",
 };
 
-static void print_callback_timings(struct scx_weightedcg_bpf *skel)
+static const char * const map_scope_names[] = {
+	[MAP_SCOPE_PER_CPU_VALUE] = "per_cpu_value",
+	[MAP_SCOPE_CPU_INDEXED] = "cpu_indexed",
+	[MAP_SCOPE_TASK_LOCAL] = "task_local",
+	[MAP_SCOPE_CGROUP_SHARED] = "cgroup_shared",
+	[MAP_SCOPE_GLOBAL_SHARED] = "global_shared",
+};
+
+static const enum map_value_scope map_scopes[MAP_NR] = {
+	[MAP_STATS] = MAP_SCOPE_PER_CPU_VALUE,		/* PERCPU_ARRAY */
+	[MAP_CPU_CTX] = MAP_SCOPE_CPU_INDEXED,		/* ARRAY keyed by CPU */
+	[MAP_CGRP_CTX] = MAP_SCOPE_CGROUP_SHARED,	/* CGRP_STORAGE */
+	[MAP_CGV_NODE_STASH] = MAP_SCOPE_CGROUP_SHARED,	/* HASH keyed by cgid */
+	[MAP_CLS_CNTS] = MAP_SCOPE_GLOBAL_SHARED,	/* one-element ARRAY */
+	[MAP_CPUSET] = MAP_SCOPE_CGROUP_SHARED,		/* HASH keyed by cgid */
+	[MAP_RT_TASK_ASSIGNMENTS] = MAP_SCOPE_TASK_LOCAL, /* HASH keyed by pid */
+	[MAP_TASK_VTIME] = MAP_SCOPE_TASK_LOCAL,		/* HASH keyed by pid */
+	[MAP_CGRP_STATS] = MAP_SCOPE_CGROUP_SHARED,	/* HASH keyed by cgid */
+	[MAP_TASK_CTX] = MAP_SCOPE_TASK_LOCAL,		/* TASK_STORAGE */
+};
+#endif
+
+#if CALLBACK_STATS || MAP_OP_STATS
+static __u64 histogram_percentile(const __u64 *hist, __u64 count,
+				  unsigned int percentile)
+{
+	__u64 seen = 0;
+	__u64 rank;
+	int bucket;
+
+	if (!count)
+		return 0;
+
+	rank = (uint64_t)(((__uint128_t)count * percentile + 99) / 100);
+	for (bucket = 0; bucket < TIMING_HIST_BUCKETS; bucket++) {
+		seen += hist[bucket];
+		if (seen >= rank)
+			return bucket == 63 ? UINT64_MAX : (1ULL << (bucket + 1)) - 1;
+	}
+
+	return UINT64_MAX;
+}
+#endif
+
+#if CALLBACK_STATS || MAP_OP_STATS
+static double timing_lifetime_s(struct scx_weightedcg_bpf *skel)
+{
+	struct timespec now;
+	__u64 started_ns = skel->bss->timing_started_ns;
+	__u64 ended_ns = skel->bss->timing_ended_ns;
+	__u64 now_ns;
+
+	if (!started_ns)
+		return 0;
+
+	if (ended_ns > started_ns)
+		return (ended_ns - started_ns) / 1e9;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_ns = (__u64)now.tv_sec * 1000000000ull + now.tv_nsec;
+	return now_ns > started_ns ? (now_ns - started_ns) / 1e9 : 0;
+}
+#endif
+
+#if CALLBACK_STATS
+static void print_callback_timings(struct scx_weightedcg_bpf *skel,
+				   double lifetime_s)
 {
 	int idx;
 
@@ -103,14 +174,27 @@ static void print_callback_timings(struct scx_weightedcg_bpf *skel)
 		if (!timing->count)
 			continue;
 
-		printf("CALLBACK   %-17s avg:%9.1f ns calls:%12llu\n",
+		printf("CALLBACK   %-17s calls:%12llu rate:%10.1f/s "
+		       "mean:%9.1f ns p50<=%9llu p95<=%9llu p99<=%9llu ns "
+		       "total:%14llu ns\n",
 		       callback_names[idx],
+		       (unsigned long long)timing->count,
+		       lifetime_s > 0 ? timing->count / lifetime_s : 0.0,
 		       (double)timing->total_ns / timing->count,
-		       (unsigned long long)timing->count);
+		       (unsigned long long)histogram_percentile(
+			       timing->latency_hist, timing->count, 50),
+		       (unsigned long long)histogram_percentile(
+			       timing->latency_hist, timing->count, 95),
+		       (unsigned long long)histogram_percentile(
+			       timing->latency_hist, timing->count, 99),
+		       (unsigned long long)timing->total_ns);
 	}
 }
+#endif
 
-static void print_map_timings(struct scx_weightedcg_bpf *skel)
+#if MAP_OP_STATS
+static void print_map_timings(struct scx_weightedcg_bpf *skel,
+			      double lifetime_s)
 {
 	int map, op;
 
@@ -122,18 +206,33 @@ static void print_map_timings(struct scx_weightedcg_bpf *skel)
 			if (!timing->count)
 				continue;
 
-			printf("MAP        %-18s %-11s avg:%9.1f ns max:%9llu ns "
-			       "slow(>=%u ns):%10llu (%5.2f%%) ops:%12llu\n",
+			printf("MAP        %-18s %-11s %-15s ops:%12llu "
+			       "rate:%10.1f/s mean:%9.1f ns "
+			       "p50<=%9llu p95<=%9llu p99<=%9llu max:%9llu ns "
+			       "slow(>=%u ns):%10llu (%5.2f%%, %8.1f/s) "
+			       "total:%14llu ns\n",
 			       map_names[map], map_op_names[op],
+			       map_scope_names[map_scopes[map]],
+			       (unsigned long long)timing->count,
+			       lifetime_s > 0 ? timing->count / lifetime_s : 0.0,
 			       (double)timing->total_ns / timing->count,
+			       (unsigned long long)histogram_percentile(
+				       timing->latency_hist, timing->count, 50),
+			       (unsigned long long)histogram_percentile(
+				       timing->latency_hist, timing->count, 95),
+			       (unsigned long long)histogram_percentile(
+				       timing->latency_hist, timing->count, 99),
 			       (unsigned long long)timing->max_ns,
 			       MAP_SLOW_OP_NS,
 			       (unsigned long long)timing->slow_count,
 			       100.0 * timing->slow_count / timing->count,
-			       (unsigned long long)timing->count);
+			       lifetime_s > 0 ?
+				       timing->slow_count / lifetime_s : 0.0,
+			       (unsigned long long)timing->total_ns);
 		}
 	}
 }
+#endif
 
 static void read_cgrp_stats(struct scx_weightedcg_bpf *skel) 
 {
@@ -337,8 +436,15 @@ restart:
 		printf("BAD      remove:%6llu\n",
 		       acc_stats[STAT_BAD_REMOVAL]);
 
-		print_callback_timings(skel);
-		print_map_timings(skel);
+#if CALLBACK_STATS || MAP_OP_STATS
+		double lifetime_s = timing_lifetime_s(skel);
+#if CALLBACK_STATS
+		print_callback_timings(skel, lifetime_s);
+#endif
+#if MAP_OP_STATS
+		print_map_timings(skel, lifetime_s);
+#endif
+#endif
 		read_cgrp_stats( skel );
 		
 		fflush(stdout);
@@ -347,10 +453,17 @@ restart:
 	}
 
 	bpf_link__destroy(link);
+#if CALLBACK_STATS || MAP_OP_STATS
+	double final_lifetime = timing_lifetime_s(skel);
+#if CALLBACK_STATS
 	printf("\n[FINAL CALLBACK TIMINGS]\n");
-	print_callback_timings(skel);
+	print_callback_timings(skel, final_lifetime);
+#endif
+#if MAP_OP_STATS
 	printf("\n[FINAL MAP OPERATION TIMINGS]\n");
-	print_map_timings(skel);
+	print_map_timings(skel, final_lifetime);
+#endif
+#endif
 	ecode = UEI_REPORT(skel, uei);
 	scx_weightedcg_bpf__destroy(skel);
 
