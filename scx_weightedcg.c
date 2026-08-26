@@ -215,9 +215,6 @@ restart:
 
 	skel->rodata->cgrp_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
     skel->rodata->task_slice_ns = __COMPAT_ENUM_OR_ZERO("scx_public_consts", "SCX_SLICE_DFL");
-	/* Temporary experiment: match the default SCHED_RR quantum. */
-	//skel->rodata->cgrp_slice_ns = 100ULL * 1000 * 1000;
-	//skel->rodata->task_slice_ns = 100ULL * 1000 * 1000;
 
 
 	printf("slice=%.1lfms intv=%.1lfs dump_cgrps=%d",

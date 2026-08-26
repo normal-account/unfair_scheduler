@@ -1,17 +1,12 @@
 #include <scx/common.bpf.h>
 #include "scx_weightedcg.h"
 
-#if !DEBUG
-#undef log
-#define log(fmt, channel, ...) do { } while (0)
-#endif
-
 /*
 * Maximum amount of retries to find a valid cgroup.
 */
 enum {
     FALLBACK_DSQ		= 0,
-    CGROUP_MAX_RETRIES	= 3,
+    CGROUP_MAX_RETRIES	= 8,
 };
 
 char _license[] SEC("license") = "GPL";
@@ -3020,6 +3015,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)cgroup_move,
         .init			    = (void *)init,
         .exit			    = (void *)ufs_exit,
-        .flags			    = /*SCX_OPS_HAS_CGROUP_WEIGHT ||*/ SCX_OPS_ENQ_LAST,
+        .flags			    = SCX_OPS_ENQ_LAST,
         .timeout_ms		    = 0,
         .name			    = "weightedcg");

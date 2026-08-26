@@ -129,11 +129,11 @@ struct cgrp_stats {
 #endif
 
 #ifndef DUMP_TRACES
-#define DUMP_TRACES 1
+#define DUMP_TRACES 0
 #endif
 
 #if DEBUG
-#define log(fmt, rt_class, ...) if ( rt_class == 1 ) bpf_printk(fmt, ##__VA_ARGS__)
+#define log(fmt, rt_class, ...) if ( rt_class == 2 ) bpf_printk(fmt, ##__VA_ARGS__)
 #else
 #define log(fmt, rt_class, ...)
 #endif
