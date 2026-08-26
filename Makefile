@@ -16,6 +16,8 @@ CFLAGS = -O2 -g -std=gnu11
 PKGCONF ?= pkg-config
 LIBBPF_CFLAGS := $(shell $(PKGCONF) --cflags libbpf)
 LIBBPF_LIBS   := $(shell $(PKGCONF) --libs   libbpf)
+NUMA_CFLAGS   := $(shell $(PKGCONF) --cflags numa)
+NUMA_LIBS     := $(shell $(PKGCONF) --libs   numa)
 
 .PHONY: all build vmlinux start stop logs state loader start_loader clean
 
@@ -53,11 +55,11 @@ state:
 loader: $(LOADER_NAME)
 
 $(LOADER_NAME): $(SCHED_NAME).skel.h
-	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) \
+	$(CC) $(CFLAGS) $(LIBBPF_CFLAGS) $(NUMA_CFLAGS) \
 	  -I . \
 	  -I /usr/include/bpf \
 	  -I $(KERNEL_SRC_DIR)/tools/sched_ext/include \
-	  $(LOADER_NAME).c -o $(LOADER_NAME) $(LIBBPF_LIBS)
+	  $(LOADER_NAME).c -o $(LOADER_NAME) $(LIBBPF_LIBS) $(NUMA_LIBS)
 
 # Start your scheduler via the loader (keeps the process alive)
 start_loader: loader

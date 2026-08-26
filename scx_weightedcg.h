@@ -42,8 +42,10 @@ enum stat_idx {
 	STAT_NR,
 };
 
-#define CPU_MASK_BITS 256
-#define MASK_WORDS    (CPU_MASK_BITS / 64)
+#define MAX_CPUS      1024
+#define NUMA_NO_NODE  (-1)
+#define CPU_MASK_BITS 96
+#define MASK_WORDS    ((CPU_MASK_BITS + 63) / 64)
 
 struct cgrp_ctx {
 	u32			nr_active;

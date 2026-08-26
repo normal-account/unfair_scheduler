@@ -1,11 +1,12 @@
 #include <scx/common.bpf.h>
 #include "scx_weightedcg.h"
+
 /*
 * Maximum amount of retries to find a valid cgroup.
 */
 enum {
     FALLBACK_DSQ		= 0,
-    CGROUP_MAX_RETRIES	= 1024,
+    CGROUP_MAX_RETRIES	= 8,
 };
 
 char _license[] SEC("license") = "GPL";
@@ -13,6 +14,7 @@ char _license[] SEC("license") = "GPL";
 const volatile u32 nr_cpus;	/* !0 for veristat, set during init */
 const volatile u64 cgrp_slice_ns;
 const volatile u64 task_slice_ns;
+const volatile s32 cpu_numa_node[MAX_CPUS];
 
 const u32 NR_CPUS_LOG = 96;
 #if RT_ACTIVE_CHECK
@@ -52,6 +54,7 @@ struct cpu_ctx {
     u64 rt_vtime_now;   // min-vtime base for RT tasks on this CPU
 
     u32 rt_claim_pid;  // 0 = free, else pid that reserved this cpu for RT
+    u64 rt_assigned_cnt; // stable RT task assignments targeting this CPU
     #if RT_ACTIVE_CHECK
     u32 rt_active;     // 1 once an RT task has been assigned to this CPU
     #endif
@@ -60,9 +63,6 @@ struct cpu_ctx {
     u64  first_move_ts;         // when we successfully moved that DSQ to local
 #endif
 };
-
-
-#define MAX_CPUS 1024
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -298,7 +298,7 @@ static __always_inline void cnt_dec(struct cpu_ctx *cpuc, bool is_rt, u32 cpu, s
 
 enum cpu_runcls { CPU_IDLING = 0, CPU_BK, CPU_RT };
 
-static __always_inline enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
+static __attribute__((noinline)) enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
 {  
     struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
     if (!cpuc) return CPU_BK; // conservative
@@ -333,6 +333,19 @@ struct {
     __type(value, struct cpuset_bits);
 } cpuset_map SEC(".maps");
 
+struct rt_task_assignment {
+    __u32 cpu;
+    __u64 cgid;
+    struct cpuset_bits cpuset;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32); // pid
+    __type(value, struct rt_task_assignment);
+} rt_task_assignments SEC(".maps");
+
 static __always_inline void cpuset_ensure_entry(__u64 cgid) {
     struct cpuset_bits zero = {};
     bpf_map_update_elem(&cpuset_map, &cgid, &zero, BPF_NOEXIST);
@@ -362,23 +375,231 @@ static __always_inline bool mask_test_cpu(struct cpuset_bits *st, __u32 cpu)
 
     return (word >> bit) & 1ull;
 }
+struct refresh_cgrp_cpuset_ctx {
+    const struct cpumask *src;
+    struct cpuset_bits *st;
+};
+
+static long refresh_cgrp_cpuset_cb(u32 cpu, void *data)
+{
+    struct refresh_cgrp_cpuset_ctx *ctx = data;
+
+    if (cpu >= nr_cpus)
+        return 1;
+
+    if (bpf_cpumask_test_cpu((s32)cpu, ctx->src))
+        mask_set_cpu(ctx->st, cpu);
+
+    return 0;
+}
+
 static __always_inline void refresh_cgrp_cpuset(__u64 cgid, const struct task_struct *p)
 {
-    const struct cpumask *src = (const struct cpumask *)p->cpus_ptr;
-
     struct cpuset_bits *st = bpf_map_lookup_elem(&cpuset_map, &cgid);
     if (!st) return;
 
-    for (int i = 0; i < CPU_MASK_BITS; i++)
-    {
-        if (i >= nr_cpus || i >= CPU_MASK_BITS) break;
-        
-        if (bpf_cpumask_test_cpu(i, src)) 
-        {   
-            mask_set_cpu(st, i);
-        }
-    }
+    __builtin_memset(st->mask, 0, sizeof(st->mask));
+
+    struct refresh_cgrp_cpuset_ctx ctx = {
+        .src = (const struct cpumask *)p->cpus_ptr,
+        .st = st,
+    };
+
+    bpf_loop(CPU_MASK_BITS, refresh_cgrp_cpuset_cb, &ctx, 0);
     st->init = 1;
+}
+
+static __always_inline u64 rt_assigned_count(u32 cpu)
+{
+    struct cpu_ctx *cpuc;
+
+    if (cpu >= nr_cpus)
+        return ~0ULL;
+
+    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    if (!cpuc)
+        return ~0ULL;
+
+    return __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 0);
+}
+
+static __always_inline void rt_assigned_count_inc(u32 cpu)
+{
+    struct cpu_ctx *cpuc;
+
+    if (cpu >= nr_cpus)
+        return;
+
+    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    if (cpuc)
+        __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 1);
+}
+
+static __always_inline void rt_assigned_count_dec(u32 cpu)
+{
+    struct cpu_ctx *cpuc;
+    u64 old;
+
+    if (cpu >= nr_cpus)
+        return;
+
+    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    if (!cpuc)
+        return;
+
+    old = __sync_fetch_and_sub(&cpuc->rt_assigned_cnt, 1);
+    if (!old) {
+        __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 1);
+        log("\trt_assigned_count_dec: underflow on CPU %u", 1, cpu);
+    }
+}
+
+static bool assignment_cpuset_allows(struct cpuset_bits *st, u32 cpu)
+{
+    if (!st || !st->init)
+        return false;
+
+    return mask_test_cpu(st, cpu);
+}
+
+struct least_assigned_cpu_ctx {
+    struct cpuset_bits *st;
+    u32 best_cpu;
+    u64 best_count;
+};
+
+static long least_assigned_cpu_cb(u32 cpu, void *data)
+{
+    struct least_assigned_cpu_ctx *ctx = data;
+    struct cpu_ctx *cpuc;
+
+    if (cpu >= nr_cpus)
+        return 1;
+
+    if (!assignment_cpuset_allows(ctx->st, cpu))
+        return 0;
+
+    cpuc = bpf_map_lookup_elem(&cpu_ctx, &cpu);
+    u64 count = cpuc ? __sync_fetch_and_add(&cpuc->rt_assigned_cnt, 0) : ~0ULL;
+
+    if (count < ctx->best_count) {
+        ctx->best_count = count;
+        ctx->best_cpu = cpu;
+        if (!count)
+            return 1;
+    }
+
+    return 0;
+}
+
+static __always_inline u32 least_assigned_cpu_in_cpuset(struct cpuset_bits *st)
+{
+    struct least_assigned_cpu_ctx ctx = {
+        .st = st,
+        .best_cpu = nr_cpus,
+        .best_count = ~0ULL,
+    };
+
+    bpf_loop(CPU_MASK_BITS, least_assigned_cpu_cb, &ctx, 0);
+
+    return ctx.best_cpu;
+}
+
+struct find_first_allowed_cpu_ctx {
+    const struct cpumask *allowed;
+    u32 best_cpu;
+};
+
+static long find_first_allowed_cpu_cb(u32 cpu, void *data)
+{
+    struct find_first_allowed_cpu_ctx *ctx = data;
+
+    if (cpu >= nr_cpus)
+        return 1;
+
+    if (bpf_cpumask_test_cpu((s32)cpu, ctx->allowed)) {
+        ctx->best_cpu = cpu;
+        return 1;
+    }
+
+    return 0;
+}
+
+struct rt_balance_ctx {
+    u32 moved;
+};
+
+static long balance_rt_assignment_cb(void *map, void *key, void *val, void *priv)
+{
+    u32 *pidp = key;
+    struct rt_task_assignment *asn = val;
+    struct rt_balance_ctx *ctx = priv;
+    u32 src_cpu, dst_cpu;
+    u64 src_count, dst_count;
+
+    if (!pidp || !asn || !ctx)
+        return 0;
+
+#if DEBUG
+    log("\tRT_ASSIGN pid=%u cpu=%u cgid=%llu", 1,
+        *pidp, asn->cpu, asn->cgid);
+
+    if (ctx->moved)
+        return 0;
+#endif
+
+    src_cpu = asn->cpu;
+    if (src_cpu >= nr_cpus)
+        return 0;
+
+    src_count = rt_assigned_count(src_cpu);
+    if (src_count <= 1)
+        return 0;
+
+    dst_cpu = least_assigned_cpu_in_cpuset(&asn->cpuset);
+    if (dst_cpu >= nr_cpus || dst_cpu == src_cpu)
+        return 0;
+
+    dst_count = rt_assigned_count(dst_cpu);
+    if (src_count <= dst_count + 1)
+        return 0;
+
+    rt_assigned_count_dec(src_cpu);
+    rt_assigned_count_inc(dst_cpu);
+    asn->cpu = dst_cpu;
+    ctx->moved++;
+
+    log("\tbalance_rt_assignments: moved pid %u from CPU %u to CPU %u",
+        1, *pidp, src_cpu, dst_cpu);
+
+#if DEBUG
+    return 0;
+#else
+    return 1;
+#endif
+}
+
+#define RT_BALANCE_MAX_MOVES 4
+
+static __attribute__((noinline)) void balance_rt_assignments(void)
+{
+#if DEBUG
+    log("\tRT_ASSIGN_DUMP_BEGIN", 1);
+#endif
+
+    #pragma clang loop unroll(disable)
+    for (u32 move = 0; move < RT_BALANCE_MAX_MOVES; move++) {
+        struct rt_balance_ctx ctx = {};
+
+        bpf_for_each_map_elem(&rt_task_assignments, balance_rt_assignment_cb, &ctx, 0);
+        if (!ctx.moved)
+            goto out;
+    }
+
+out:
+#if DEBUG
+    log("\tRT_ASSIGN_DUMP_END", 1);
+#endif
 }
 
 /* CPUSET TRACKING END */
@@ -748,24 +969,6 @@ struct {
 // Gets inc'd on weight tree changes to expire the cached hweights
 u64 hweight_gen = 1;
 
-static __inline bool comm_eq(const char *a, const char *b)
-{
-    for (int i = 0; i < 16; i++) {
-        if (a[i] != b[i])
-            return false;
-        if (a[i] == '\0')
-            return true;
-    }
-    return true;
-}
-
-static bool should_log(const char *comm, s32 cpu)
-{
-    if (cpu >= nr_cpus)
-        return false;
-    return NULL == comm ? false : comm_eq(comm, "intermittent") || comm_eq(comm, "burn_cpu");
-}
-
 static u64 div_round_up(u64 dividend, u64 divisor)
 {
     return (dividend + divisor - 1) / divisor;
@@ -976,9 +1179,10 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
     struct cgv_node *cgv_node;
     u64 cgid = cgrp->kn->id;
 
+#if DEBUG
     char cg_name_buf[32];
     bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
-
+#endif
 
     stash = bpf_map_lookup_elem(&cgv_node_stash, &cgid);
     if (!stash) {
@@ -991,7 +1195,9 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
 
         cgv_node = bpf_kptr_xchg(&stash->node, NULL);
         if (!cgv_node) {
+#if DEBUG
             log("\tcgrp_enqueued: skip because cgc->queued == 1 for cgid %llu (%s)", cgc->rt_class, cgid, cg_name_buf);
+#endif
             stat_inc(STAT_ENQ_SKIP);
             return;
         }
@@ -1004,11 +1210,14 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
 
     if (!cgv_node) 
     {
+#if DEBUG
         log("\tcgrp_enqueued: cancelled because stash->node is NULL (already on the rbtree) for cgid %llu (%s)", cgc->rt_class, cgid, cg_name_buf);
+#endif
         stat_inc(STAT_ENQ_RACE);
         return;
     }
 
+#if DEBUG
     log("\tcgrp_enqueued: confirmed stash->node has been set to NULL for cgid %llu (%s) with cvtime=%llu", cgc->rt_class, cgid, cg_name_buf, cgv_node->cvtime);
 
     if (cgc->rt_class)
@@ -1019,6 +1228,7 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
     {
         log("\tcgrp_enqueued: enqueue new cgid %llu (%s) to BACKGROUND tree!", cgc->rt_class, cgid, cg_name_buf);
     }
+#endif
 
     bpf_spin_lock(&cgv_tree_lock);
     cgrp_cap_budget(cgv_node, cgc);
@@ -1037,54 +1247,89 @@ static void cgrp_enqueued(struct cgroup *cgrp, struct cgrp_ctx *cgc)
 
 /* CPUSET ASSIGNMENT START */
 
-struct rt_cpu_assign_state {
-    u32 next_cpu;   // 0, 2, 4, ...
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, struct rt_cpu_assign_state);
-} rt_cpu_assign_map SEC(".maps");
-
-static __always_inline u32 find_first_allowed_cpu(const struct cpumask *allowed)
+static u32 find_first_allowed_cpu(const struct cpumask *allowed)
 {
-#pragma clang loop unroll(disable)
-    for (u32 cpu = 0; cpu < CPU_MASK_BITS; cpu++) {
-        if (cpu >= nr_cpus)
-            break;
+    struct find_first_allowed_cpu_ctx ctx = {
+        .allowed = allowed,
+        .best_cpu = nr_cpus,
+    };
 
-        if (bpf_cpumask_test_cpu((s32)cpu, allowed))
-            return cpu;
-    }
-
-    return nr_cpus;
+    bpf_loop(CPU_MASK_BITS, find_first_allowed_cpu_cb, &ctx, 0);
+    return ctx.best_cpu;
 }
 
-static s32 alloc_even_rt_cpu(const struct cpumask *allowed)
+static u32 assign_rt_cpu(struct task_struct *p,
+                                         struct cgroup *cgrp,
+                                         struct task_ctx *taskc,
+                                         bool force)
 {
-    u32 k = 0;
-    struct rt_cpu_assign_state *st = bpf_map_lookup_elem(&rt_cpu_assign_map, &k);
+    u32 pid = (__u32)p->pid;
+    u64 cgid;
+    struct cpuset_bits *st;
+    struct rt_task_assignment *old_asn;
+    struct rt_task_assignment new_asn = {};
+    u32 old_cpu = nr_cpus;
+    u32 new_cpu;
 
-    if (!st)
-        return 0;
+    if (!cgrp || !taskc)
+        return nr_cpus;
 
-    s32 cpu = __sync_fetch_and_add(&st->next_cpu, 2);
+    cgid = cgrp->kn->id;
+    refresh_cgrp_cpuset(cgid, p);
 
-    /* Naive wrap for masks like 0,2,4,...,14 */
-    if (cpu >= nr_cpus || !bpf_cpumask_test_cpu(cpu, allowed)) {
-        __sync_lock_test_and_set(&st->next_cpu, 2);
-        return 0;
+    st = bpf_map_lookup_elem(&cpuset_map, &cgid);
+    if (!st || !st->init)
+        return find_first_allowed_cpu((const struct cpumask *)p->cpus_ptr);
+
+    old_asn = bpf_map_lookup_elem(&rt_task_assignments, &pid);
+    if (old_asn) {
+        old_cpu = old_asn->cpu;
+
+        if (!force && old_asn->cgid == cgid &&
+            old_cpu < nr_cpus && assignment_cpuset_allows(st, old_cpu)) {
+            taskc->rt_cpu = old_cpu;
+            return old_cpu;
+        }
+    } else if (taskc->rt_cpu < nr_cpus) {
+        old_cpu = taskc->rt_cpu;
     }
 
-    return cpu;
+    new_cpu = least_assigned_cpu_in_cpuset(st);
+    if (new_cpu >= nr_cpus)
+        new_cpu = find_first_allowed_cpu((const struct cpumask *)p->cpus_ptr);
+
+    if (new_cpu >= nr_cpus)
+        return nr_cpus;
+
+    if (old_cpu < nr_cpus && old_cpu != new_cpu)
+        rt_assigned_count_dec(old_cpu);
+
+    if (old_cpu != new_cpu)
+        rt_assigned_count_inc(new_cpu);
+
+    new_asn.cpu = new_cpu;
+    new_asn.cgid = cgid;
+    new_asn.cpuset = *st;
+
+    bpf_map_update_elem(&rt_task_assignments, &pid, &new_asn, BPF_ANY);
+    taskc->rt_cpu = new_cpu;
+
+    log("\tassign_rt_cpu: pid %d comm %s cgid=%llu cpu %u -> %u",
+        1, p->pid, p->comm, cgid, old_cpu, new_cpu);
+
+    balance_rt_assignments();
+
+    return new_cpu;
 }
 
-static __always_inline u32 get_or_assign_rt_cpu(struct task_struct *p,
+static u32 get_or_assign_rt_cpu(struct task_struct *p,
                                                 const struct cpumask *allowed)
 {
     struct task_ctx * taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+    struct rt_task_assignment *asn;
+    struct cgroup *cgrp;
+    u32 pid = (__u32)p->pid;
+    u32 cpu;
 
     if (!taskc)
     {
@@ -1092,22 +1337,55 @@ static __always_inline u32 get_or_assign_rt_cpu(struct task_struct *p,
         return find_first_allowed_cpu(allowed);
     }
 
-    s32 cpu = taskc->rt_cpu;
+    asn = bpf_map_lookup_elem(&rt_task_assignments, &pid);
+    if (asn && asn->cpu < nr_cpus && bpf_cpumask_test_cpu((s32)asn->cpu, allowed)) {
+        taskc->rt_cpu = asn->cpu;
+        return asn->cpu;
+    }
 
-    if (cpu >= 0 && cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, allowed))
+    cpu = taskc->rt_cpu;
+    if (cpu < nr_cpus && bpf_cpumask_test_cpu((s32)cpu, allowed))
         return cpu;
 
-    cpu = alloc_even_rt_cpu(allowed);
-    taskc->rt_cpu = cpu;
+    cgrp = scx_bpf_task_cgroup(p);
+    cpu = assign_rt_cpu(p, cgrp, taskc, false);
+    bpf_cgroup_release(cgrp);
+
     return cpu;
+}
+
+static void release_rt_cpu_assignment(struct task_struct *p,
+                                                     struct task_ctx *taskc)
+{
+    u32 pid = (__u32)p->pid;
+    struct rt_task_assignment *asn;
+    u32 old_cpu = nr_cpus;
+
+    asn = bpf_map_lookup_elem(&rt_task_assignments, &pid);
+    if (asn)
+        old_cpu = asn->cpu;
+    else if (taskc && taskc->rt_cpu < nr_cpus)
+        old_cpu = taskc->rt_cpu;
+
+    if (old_cpu < nr_cpus)
+        rt_assigned_count_dec(old_cpu);
+
+    bpf_map_delete_elem(&rt_task_assignments, &pid);
+
+    if (taskc)
+        taskc->rt_cpu = nr_cpus;
+
+    log("\trelease_rt_cpu_assignment: pid %d comm %s released CPU %u",
+        1, p->pid, p->comm, old_cpu);
+
+    balance_rt_assignments();
 }
 
 
 /* CPUSET ASSIGNMENT END */
 
 #if PIN_TASKS
-static __attribute__((noinline)) u32
-pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
+static u32 pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
                         bool *is_idle, bool *can_kick)
 {
     const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
@@ -1146,11 +1424,11 @@ static __always_inline bool rt_try_claim_cpu(u32 cpu, u32 pid, bool is_idle)
 
     if ( !val )
     {
-        log("pick_cpu_to_kick_for_rt: REJECTED by %u (locked by %u) %d", 1, cpu, cpuc->rt_claim_pid, pid);
+        log("\tpick_cpu_to_kick_for_rt: REJECTED by %u (locked by %u) %d", 1, cpu, cpuc->rt_claim_pid, pid);
     }
     else
     {
-        log("pick_cpu_to_kick_for_rt: ACCEPTED by %u (locked by %u)", 1, cpu, cpuc->rt_claim_pid);
+        log("\tpick_cpu_to_kick_for_rt: ACCEPTED by %u (locked by %u)", 1, cpu, cpuc->rt_claim_pid);
     }
 
     return val;
@@ -1185,6 +1463,14 @@ static __always_inline void set_flags_from_cls(enum cpu_runcls cls,
 {
     *is_idle  = (cls == CPU_IDLING);
     *can_kick = (cls == CPU_BK);
+}
+
+static __always_inline s32 numa_node_for_cpu(u32 cpu)
+{
+    if (cpu >= nr_cpus || cpu >= MAX_CPUS)
+        return NUMA_NO_NODE;
+
+    return cpu_numa_node[cpu];
 }
 
 /* Bounded Euclid gcd (verifier-friendly). */
@@ -1223,6 +1509,95 @@ static __always_inline u32 pick_coprime_stride(u32 n)
 
     return step; /* 1 if we failed to find one in a few tries */
 }
+
+struct rt_cpu_scan_ctx {
+    const struct cpumask *allowed;
+    s32 preferred_node;
+    u32 local_only;
+    u32 pid;
+    u32 hint_cpu;
+    u32 n;
+    u32 idx;
+    u32 step;
+    u32 selected_idle;
+    u32 best_bk;
+    u32 best_rt;
+    u32 best_bk_load;
+    u32 best_rt_load;
+};
+
+static long scan_rt_cpu_cb(u32 unused, void *data)
+{
+    struct rt_cpu_scan_ctx *ctx = data;
+    u32 idx = ctx->idx;
+
+    if (bpf_cpumask_test_cpu((s32)idx, ctx->allowed) &&
+        (!ctx->local_only ||
+         numa_node_for_cpu(idx) == ctx->preferred_node)) {
+        enum cpu_runcls cls = cpu_cls(idx, ctx->pid);
+
+        if (cls == CPU_IDLING) {
+            if (rt_try_claim_cpu(idx, ctx->pid, true)) {
+                ctx->selected_idle = idx;
+                return 1;
+            }
+            if (ctx->best_rt == ctx->n)
+                ctx->best_rt = idx;
+        } else {
+            u32 load = cpu_load_for_pick(idx);
+
+            if (cls == CPU_BK) {
+                if (load < ctx->best_bk_load ||
+                    (load == ctx->best_bk_load && idx == ctx->hint_cpu)) {
+                    ctx->best_bk = idx;
+                    ctx->best_bk_load = load;
+                }
+            } else {
+                if (load < ctx->best_rt_load ||
+                    (load == ctx->best_rt_load && idx == ctx->hint_cpu)) {
+                    ctx->best_rt = idx;
+                    ctx->best_rt_load = load;
+                }
+            }
+        }
+    }
+
+    if (ctx->n > 1) {
+        idx += ctx->step;
+        if (idx >= ctx->n)
+            idx -= ctx->n;
+        ctx->idx = idx;
+    }
+
+    return 0;
+}
+
+static __attribute__((noinline)) u32
+scan_rt_cpus(struct rt_cpu_scan_ctx *scan, bool *is_idle, bool *can_kick)
+{
+    const u32 n = scan->n;
+
+    bpf_loop(n, scan_rt_cpu_cb, scan, 0);
+
+    if (scan->selected_idle != n) {
+        *is_idle = true;
+        return scan->selected_idle;
+    }
+
+    if (scan->best_bk != n &&
+        rt_try_claim_cpu(scan->best_bk, scan->pid, false)) {
+        set_flags_from_cls(CPU_BK, is_idle, can_kick);
+        return scan->best_bk;
+    }
+
+    if (scan->best_rt != n) {
+        set_flags_from_cls(CPU_RT, is_idle, can_kick);
+        return scan->best_rt;
+    }
+
+    return n;
+}
+
 static __attribute__((noinline)) u32
 pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
                         bool *is_idle, bool *can_kick)
@@ -1243,130 +1618,47 @@ pick_cpu_to_kick_for_rt(struct task_struct *p, u32 hint_cpu,
 
     const bool hint_ok = (hint_cpu < n) &&
                          bpf_cpumask_test_cpu((s32)hint_cpu, allowed);
-
-    enum cpu_runcls hint_cls = CPU_RT;
-    u32 hint_load = 0;
-
-    if (hint_ok) {
-        hint_cls = cpu_cls(hint_cpu, p->pid);
-        if (hint_cls != CPU_IDLING)
-            hint_load = cpu_load_for_pick(hint_cpu);
-    }
+    const s32 preferred_node = hint_ok ?
+                               numa_node_for_cpu(hint_cpu) : NUMA_NO_NODE;
 
     // Pseudo-random permutation (full cycle via coprime stride)
 
     u32 start = bpf_get_prandom_u32() % n;
     u32 step  = (n == 1) ? 0 : pick_coprime_stride(n);
-    u32 blacklisted = nr_cpus;
+    u32 cpu;
+    struct rt_cpu_scan_ctx scan = {
+        .allowed = allowed,
+        .preferred_node = preferred_node,
+        .local_only = preferred_node != NUMA_NO_NODE,
+        .pid = pid,
+        .hint_cpu = hint_cpu,
+        .n = n,
+        .idx = start,
+        .step = step,
+        .selected_idle = n,
+        .best_bk = n,
+        .best_rt = n,
+        .best_bk_load = ~0u,
+        .best_rt_load = ~0u,
+    };
 
-    u32 best_bk, best_rt, best_bk_load, best_rt_load;
+    if (preferred_node != NUMA_NO_NODE) {
+        cpu = scan_rt_cpus(&scan, is_idle, can_kick);
+        if (cpu < n)
+            return cpu;
 
-#pragma clang loop unroll(disable)
-    for (u32 attempt = 0; attempt < 2; attempt++) {
-        /* If hint is idle, try to claim it (don’t return unclaimed). */
-        if (hint_ok && hint_cls == CPU_IDLING) {
-            if (rt_try_claim_cpu(hint_cpu, pid, true)) {
-                *is_idle = true;
-                return hint_cpu;
-            }
-            /* someone else claimed it – fall through and scan */
-        }
-
-        best_bk = nr_cpus, best_bk_load = ~0u;
-        best_rt = nr_cpus, best_rt_load = ~0u;
-        
-        u32 idx = start;
-
-        u32 k = 0;
-        bpf_for(k, 0, n) {
-            if (bpf_cpumask_test_cpu((s32)idx, allowed)) {
-                enum cpu_runcls cls = cpu_cls(idx, p->pid);
-
-                if (cls == CPU_IDLING) {
-                    log("cpu IDLE=%u (cls=%u)", 2, idx);
-
-                    // Try to claim immediately; if fails, keep scanning.
-                    if (rt_try_claim_cpu(idx, pid, true)) {
-                        *is_idle = true;
-                        return idx;
-                    }
-
-                    // Prevent edge case where all CPUs are idle but claimed. This ensures a valid CPU is returned.
-                    if ( best_rt == nr_cpus ) 
-                    {
-                        log("fallback to best_rt=%u (cls=%u)", 1, idx, (u32)cls);
-                        best_rt = idx;
-                    }
-                } else {
-                    //log("cpu NOT IDLE=%u (cls=%u)", 1, idx, (u32)cls);
-
-                    u32 load = cpu_load_for_pick(idx);
-
-                    if (cls == CPU_BK) {
-                        if (load < best_bk_load && idx != blacklisted) {
-                            best_bk = idx;
-                            best_bk_load = load;
-                        }
-                    } else { /* CPU_RT */
-                        if (load < best_rt_load) {
-                            best_rt = idx;
-                            best_rt_load = load;
-                        }
-                    }
-                }
-            }
-
-            if (n > 1) {
-                idx += step;
-                if (idx >= n)
-                    idx -= n;
-            }
-        }
-
-
-        log("pick_cpu_to_kick_for_rt: best bk=%u and rt=%u for pid %d", 2, best_bk, best_rt, p->pid);
-
-        // Prefer BK, but claim deterministically before returning.
-        if (best_bk != nr_cpus) {
-            if (hint_ok && hint_cls == CPU_BK && hint_load == best_bk_load) {
-                if (rt_try_claim_cpu(hint_cpu, pid, false)) {
-                    set_flags_from_cls(hint_cls, is_idle, can_kick);
-                    return hint_cpu;
-                }
-                if (hint_cpu != best_bk && rt_try_claim_cpu(best_bk, pid, false)) {
-                    set_flags_from_cls(CPU_BK, is_idle, can_kick);
-                    return best_bk;
-                }
-            } else {
-                if (rt_try_claim_cpu(best_bk, pid, false)) {
-                    set_flags_from_cls(CPU_BK, is_idle, can_kick);
-                    return best_bk;
-                }
-            }
-
-            // claim failed -> retry a fresh permutation
-            blacklisted = best_bk;
-        }
-        // nothing usable this attempt
+        scan.local_only = false;
+        scan.idx = start;
+        scan.selected_idle = n;
+        scan.best_bk = n;
+        scan.best_rt = n;
+        scan.best_bk_load = ~0u;
+        scan.best_rt_load = ~0u;
     }
 
-    // If there are no RT CPUs, but all the BK ones were claimed
-    if ( best_rt == nr_cpus ) 
-    {
-        best_rt = best_bk;
-    }
-
-    // Fall back to RT, with claim + hint tie-break.
-    if (best_rt != nr_cpus) {
-        if (hint_ok && hint_cls == CPU_RT && hint_load == best_rt_load) 
-        {
-            set_flags_from_cls(hint_cls, is_idle, can_kick);
-            return hint_cpu;
-        } else {
-            set_flags_from_cls(CPU_RT, is_idle, can_kick);
-            return best_rt;
-        }
-    }
+    cpu = scan_rt_cpus(&scan, is_idle, can_kick);
+    if (cpu < n)
+        return cpu;
 
     log("pick_cpu_to_kick_for_rt: FOUND NOTHING for pid %d", 2, p->pid);
 
@@ -1436,13 +1728,11 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
                     // Determine if task should be enqueued at head or not
                     u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
                     u64 tv    = p->scx.dsq_vtime;
-                    //u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
     
                     s64 d = time_delta(now_v, tv);   // signed
                     is_behind = d > 0;
-                    //is_behind = d > (s64)slack_v;
     
-                     log("\tenqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+                     log("\tenqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d);
                 }
                 #endif
                 
@@ -1450,7 +1740,8 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
             }
 
             u64 rt_flags = SCX_ENQ_CPU_SELECTED;
-            if ( is_idle || can_kick || is_behind ) rt_flags |= SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+            if ( is_idle || can_kick || is_behind )
+                rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
 
@@ -1461,8 +1752,8 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
 
             if ( is_idle )
                 scx_bpf_kick_cpu(tgt, SCX_KICK_IDLE);
-           else if ( can_kick || is_behind)
-                scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
+           //else if ( can_kick || is_behind)
+           //     scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
 
 
             bpf_cgroup_release(cgrp);
@@ -1519,62 +1810,6 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
 
     // // 2. If no idle CPU, fall back to default (locality)
     // return scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-}
-
-static __always_inline void log_enq_flags(const char *tag,
-    struct task_struct *p,
-    u64 f)
-{
-/* Raw mask */
-log("%s: pid=%d enq_flags=0x%llx", 0, tag, p->pid, f);
-
-#define SHOW(_fl) do { if (f & (_fl)) log("  - " #_fl, 0); } while (0)
-
-/* public flags */
-SHOW(SCX_ENQ_WAKEUP);        /* enqueue due to wakeup */
-SHOW(SCX_ENQ_HEAD);          /* place at head of DSQ */
-SHOW(SCX_ENQ_CPU_SELECTED);  /* select_cpu chose a CPU */
-SHOW(SCX_ENQ_PREEMPT);       /* preempt target */
-SHOW(SCX_ENQ_REENQ);         /* re-enqueue (e.g. yield/time slice) */
-SHOW(SCX_ENQ_LAST);          /* last public bit (sentinel-ish) */
-
-/* internal/reserved range (top bits) */
-SHOW(SCX_ENQ_CLEAR_OPSS);    /* clear op-sched state (internal) */
-SHOW(SCX_ENQ_DSQ_PRIQ);      /* DSQ is prio-queued (internal) */
-
-#undef SHOW
-
-/* highlight any unknown bits (handy when your headers differ) */
-{
-const u64 known =
-SCX_ENQ_WAKEUP | SCX_ENQ_HEAD | SCX_ENQ_CPU_SELECTED |
-SCX_ENQ_PREEMPT | SCX_ENQ_REENQ | SCX_ENQ_LAST |
-SCX_ENQ_CLEAR_OPSS | SCX_ENQ_DSQ_PRIQ;
-u64 unknown = f & ~known;
-if (unknown)
-log("  - unknown_bits: 0x%llx", 0, unknown);
-}
-}
-
-static __always_inline bool starts_with(const char s[TASK_COMM_LEN],
-                                        const char *prefix)
-{
-#pragma unroll
-    for (int i = 0; i < TASK_COMM_LEN; i++) {
-        char pc = prefix[i];
-        char sc = s[i];
-
-        if (pc == '\0')
-            return true;   // matched the whole prefix
-
-        if (sc == '\0')
-            return false;  // string ended before prefix
-
-        if (sc != pc)
-            return false;  // mismatch
-    }
-
-    return false; // prefix longer than TASK_COMM_LEN
 }
 
 void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
@@ -1641,13 +1876,11 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
                 // Determine if task should be enqueued at head or not
                 u64 now_v = __sync_fetch_and_add(&tgtc->rt_vtime_now, 0);
                 u64 tv    = p->scx.dsq_vtime;
-                //u64 slack_v = task_slice_ns * 100 / (p->scx.weight ?: 1);
 
                 s64 d = time_delta(now_v, tv);   // signed
                 is_behind = d > 0;
-                //is_behind = d > (s64)slack_v;
 
-                 log("\tenqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld > slack=%llu)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d, slack_v );
+                log("\tenqueue: pid %d cpu %u behind=%d (now_v=%llu, dsd_vtime=%llu, d=%lld)", cgc->rt_class, p->pid, tgt, is_behind, now_v, tv, d);
             }
             #endif
 
@@ -1657,7 +1890,8 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
         // Task direct enqueue 
         u64 rt_flags = enq_flags | SCX_ENQ_CPU_SELECTED;// | SCX_ENQ_HEAD; //| SCX_ENQ_PREEMPT;
 
-        if ( is_idle || can_kick || is_behind ) rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
+        if ( is_idle || can_kick || is_behind ) 
+            rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
         
 #if WEIGHTED_FALLBACK_DSQ
         taskc->fallback_weighted = 0;
@@ -1677,8 +1911,8 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
         }
         else if ( can_kick || is_behind )
         {
-            log("\tenqueue: direct kick PREEMPT CPU %d for pid %d ", /*cgc->rt_class*/2, tgt, p->pid);
-            scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
+            //log("\tenqueue: direct kick PREEMPT CPU %d for pid %d ", /*cgc->rt_class*/2, tgt, p->pid);
+            //scx_bpf_kick_cpu(tgt, SCX_KICK_PREEMPT);
         }
     }
     else
@@ -1699,6 +1933,7 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
              * more control over when tasks with custom cpumask get issued.
              */
             //
+            //if (p->nr_cpus_allowed == 1) {
             //if (p->nr_cpus_allowed == 1 && (p->flags & PF_WQ_WORKER)) {
             if (p->nr_cpus_allowed == 1 && (p->flags & PF_KTHREAD)) {
                 stat_inc(STAT_LOCAL);
@@ -1874,7 +2109,7 @@ void BPF_STRUCT_OPS(runnable, struct task_struct *p, u64 enq_flags)
 
 #if DEBUG
     u8 rt_class = cgc ? cgc->rt_class : 0;
-    log("\trunnable: pid %d comm %s", rt_class, p->pid, p->comm);
+    log("\trunnable: pid %d comm %s rt_class=%u", rt_class, p->pid, p->comm, rt_class);
 #endif
     refresh_cgrp_cpuset( cgrp->kn->id, p );
     update_active_weight_sums(cgrp, true);
@@ -2298,9 +2533,6 @@ static bool try_pick_next_cgroup(u64 *cgidp, struct bpf_rb_root *cgv_tree, s32 c
         * This means tasks are pinned to other CPUs. We must rotate the tree
         * to avoid Head-of-Line blocking. */
 
-        char cg_name_buf[32];
-        bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), cgrp->kn->name);
-
         bpf_spin_lock(&cgv_tree_lock);
         cgv_node->cvtime += cgrp_slice_ns * HWEIGHT_ONE / (cgc->hweight ?: 1);
         bpf_rbtree_add(cgv_tree, &cgv_node->rb_node, cgv_node_less);
@@ -2549,10 +2781,18 @@ s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;
 
+    #if DEBUG
+        char cg_name_buf[32] = {};
+        bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf), args->cgroup->kn->name);
+        log("\tinit_task: pid %d comm %s cgid=%llu cgroup=%s rt_class=%u",
+            cgc->rt_class, p->pid, p->comm, args->cgroup->kn->id, cg_name_buf,
+            (u32)cgc->rt_class);
+    #endif /* DEBUG */
+
     if (cgc->rt_class)
     {
-        taskc->rt_cpu = get_or_assign_rt_cpu(p, (const struct cpumask*) p->cpus_ptr);
-        log("\tinit_task: RT task %d allocated to CPU %u", 2, p->pid, taskc->rt_cpu);
+        taskc->rt_cpu = assign_rt_cpu(p, args->cgroup, taskc, true);
+        log("\tinit_task: RT task %d allocated to CPU %u", 1, p->pid, taskc->rt_cpu);
     }
 
     p->scx.dsq_vtime = cgc->tvtime_now;
@@ -2653,14 +2893,19 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
             struct cgroup *from, struct cgroup *to)
 {
     struct cgrp_ctx *from_cgc, *to_cgc;
-    struct cgroup *cgrp;
-    struct cgrp_ctx *cgc;
     s64 delta;
-    u8 rt_class = 0;
+    bool was_rt;
 
-    /* find_cgrp_ctx() triggers scx_ops_error() on lookup failures */
-    if (!(from_cgc = find_cgrp_ctx(from)) || !(to_cgc = find_cgrp_ctx(to)))
+    /*
+     * cgroup_move has no sched_ext kfunc permissions. In particular, don't
+     * call find_cgrp_ctx(), scx_bpf_task_cgroup(), or scx_bpf_error() here.
+     */
+    from_cgc = bpf_cgrp_storage_get(&cgrp_ctx, from, 0, 0);
+    to_cgc = bpf_cgrp_storage_get(&cgrp_ctx, to, 0, 0);
+    if (!from_cgc || !to_cgc)
         return;
+
+    was_rt = from_cgc->rt_class;
 
     delta = time_delta(p->scx.dsq_vtime, from_cgc->tvtime_now);
     p->scx.dsq_vtime = to_cgc->tvtime_now + delta;
@@ -2668,33 +2913,34 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
     struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if ( !taskc ) return;
 
-    if (!from_cgc->rt_class && to_cgc->rt_class && taskc->rt_cpu >= nr_cpus)
+    if (to_cgc->rt_class)
     {
-        taskc->rt_cpu = get_or_assign_rt_cpu(p, (const struct cpumask*) p->cpus_ptr);
+        taskc->rt_cpu = assign_rt_cpu(p, to, taskc, true);
         log("\tcgroup_move: RT task %d allocated to CPU %u", 2, p->pid, taskc->rt_cpu);
+    }
+    else if (from_cgc->rt_class || taskc->rt_cpu < nr_cpus)
+    {
+        release_rt_cpu_assignment(p, taskc);
     }
 
     u32 cur_cpu = taskc->cur_cpu;
     if ( cur_cpu >= nr_cpus )
         return;
 
-    cgrp = scx_bpf_task_cgroup(p);
-    if ( cgrp )
-    {
-        cgc = find_cgrp_ctx(cgrp);
-        if ( cgc )
-        {
-            rt_class = cgc->rt_class;
-        }
-    }
-    bpf_cgroup_release(cgrp);
-
-    log("\tcgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", rt_class, p->pid, cur_cpu, from->kn->id, to->kn->id);
+    log("\tcgroup_move: moving task %d on CPU %d from cgroup %llu to cgroup %llu!!!", was_rt, p->pid, cur_cpu, from->kn->id, to->kn->id);
 
     struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
-    if (!cpuc) return;
+    if (!cpuc)
+        return;
 
-    cnt_dec( cpuc, rt_class, cur_cpu, p->pid, 0);
+    cnt_dec(cpuc, was_rt, cur_cpu, p->pid, from->kn->id);
+
+    /*
+     * The task is no longer charged to its old scheduling residency. Clearing
+     * cur_cpu prevents stopping() from decrementing the old count again; the
+     * normal enqueue/running path will charge it using its destination class.
+     */
+    taskc->cur_cpu = nr_cpus;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(init)
@@ -2720,6 +2966,9 @@ void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args 
         scx_bpf_error("exit_task: !taskc for pid %d", p->pid);
         return;
     }
+
+    if (taskc->rt_cpu < nr_cpus)
+        release_rt_cpu_assignment(p, taskc);
 
     u32 cur_cpu = taskc->cur_cpu;
     if ( cur_cpu >= nr_cpus )
@@ -2766,6 +3015,6 @@ SCX_OPS_DEFINE(weightedcg_ops,
         .cgroup_move		= (void *)cgroup_move,
         .init			    = (void *)init,
         .exit			    = (void *)ufs_exit,
-        .flags			    = SCX_OPS_HAS_CGROUP_WEIGHT || SCX_OPS_ENQ_LAST,
+        .flags			    = SCX_OPS_ENQ_LAST,
         .timeout_ms		    = 0,
         .name			    = "weightedcg");
