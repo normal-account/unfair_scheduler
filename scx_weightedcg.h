@@ -1,6 +1,14 @@
 #ifndef __SCX_WEIGHTEDCG_H
 #define __SCX_WEIGHTEDCG_H
 
+/*
+ * Opt-in PostgreSQL lock hints. We keep this disabled by default so builds
+ * without -DLOCK_HINTING=1 retain the scheduler's existing behavior.
+ */
+#ifndef LOCK_HINTING
+#define LOCK_HINTING 0
+#endif
+
 enum {
 	HWEIGHT_ONE		= 1LLU << 16,
 };
@@ -38,6 +46,15 @@ enum stat_idx {
 	STAT_PNC_AFFINITY,
 
 	STAT_BAD_REMOVAL,
+
+#if LOCK_HINTING
+	STAT_LOCK_HINT_DRAIN,
+	STAT_LOCK_HINT_DRAIN_FAIL,
+	STAT_LOCK_HINT_MSG,
+	STAT_LOCK_HINT_CONFLICT,
+	STAT_LOCK_HINT_BOOST,
+	STAT_LOCK_HINT_DISPATCH_BOOST,
+#endif
 
 	STAT_NR,
 };
