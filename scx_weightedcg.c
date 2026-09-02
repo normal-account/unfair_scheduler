@@ -15,6 +15,10 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#if LOCK_HINTING
+#include <errno.h>
+#include <sys/stat.h>
+#endif
 
 
 #ifndef FILEID_KERNFS
@@ -188,6 +192,40 @@ static void read_stats(struct scx_weightedcg_bpf *skel, __u64 *stats)
 	}
 }
 
+#if LOCK_HINTING
+static int pin_postgres_rb(struct scx_weightedcg_bpf *skel)
+{
+	const char *path = "/sys/fs/bpf/postgres_rb";
+	int err;
+
+	if (unlink(path) != 0 && errno != ENOENT) {
+		fprintf(stderr, "ERROR: unlink(%s) failed: %s\n",
+			path, strerror(errno));
+		return -errno;
+	}
+
+	err = bpf_map__pin(skel->maps.postgres_rb, path);
+	if (err) {
+		fprintf(stderr, "ERROR: bpf_map__pin(%s) failed: %d\n", path, err);
+		return err;
+	}
+
+	if (chmod("/sys/fs/bpf", 0777) != 0) {
+		fprintf(stderr, "ERROR: chmod(%s, 0777) failed: %s\n",
+			"/sys/fs/bpf", strerror(errno));
+		return errno;
+	}
+
+	if (chmod(path, 0777) != 0) {
+		fprintf(stderr, "ERROR: chmod(%s, 0777) failed: %s\n",
+			path, strerror(errno));
+		return errno;
+	}
+
+	return 0;
+}
+#endif
+
 int main(int argc, char **argv)
 {
 	struct scx_weightedcg_bpf *skel;
@@ -223,6 +261,10 @@ restart:
 	       dump_cgrps);
 
 	SCX_OPS_LOAD(skel, weightedcg_ops, scx_weightedcg_bpf, uei);
+#if LOCK_HINTING
+	if (pin_postgres_rb(skel))
+		return 1;
+#endif
 	link = SCX_OPS_ATTACH(skel, weightedcg_ops, scx_weightedcg_bpf);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
@@ -274,6 +316,16 @@ restart:
 			   stats[STAT_PNC_AFFINITY]);
 		printf("BAD      remove:%6llu\n",
 		       acc_stats[STAT_BAD_REMOVAL]);
+
+#if LOCK_HINTING
+		printf("LOCK HINT drain:%6llu fail:%6llu msg:%6llu conflict:%6llu boost:%6llu dispatch:%6llu\n",
+		       acc_stats[STAT_LOCK_HINT_DRAIN],
+		       acc_stats[STAT_LOCK_HINT_DRAIN_FAIL],
+		       acc_stats[STAT_LOCK_HINT_MSG],
+		       acc_stats[STAT_LOCK_HINT_CONFLICT],
+		       acc_stats[STAT_LOCK_HINT_BOOST],
+		       acc_stats[STAT_LOCK_HINT_DISPATCH_BOOST]);
+#endif
 
 		read_cgrp_stats( skel );
 		

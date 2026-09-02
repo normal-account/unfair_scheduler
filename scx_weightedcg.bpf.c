@@ -48,6 +48,9 @@ struct cpu_ctx {
     u64			cur_bk_at;
 
     u64         rt_cnt;
+#if LOCK_HINTING
+    u64         pi_boost_cnt;
+#endif
     u64         bk_cnt;
     u64         bk_cnt_pending;
 
@@ -110,6 +113,16 @@ struct task_ctx {
     u32     cur_cpu;        // where it's running
 
     u32     last_cpu;       // where it last ran
+
+#if LOCK_HINTING
+    u32     pi_boosted_cpu; // CPU temporarily reserved for PI boost
+    u32     pi_waiter_cnt;  // RT waiters currently boosting this task
+
+    u64     current_cgid;
+
+    u8      cgrp_rt_class;  // base class from cgroup membership
+    u8      rt_class;       // effective class, including PI promotion
+#endif
 
 #if WEIGHTED_FALLBACK_DSQ
     u64     fallback_slice_ns;
@@ -305,6 +318,11 @@ static __attribute__((noinline)) enum cpu_runcls cpu_cls(u32 cpu, u32 pid)
 
     if (__sync_fetch_and_add(&cpuc->rt_cnt, 0) )
         return CPU_RT;
+
+#if LOCK_HINTING
+    if (__sync_fetch_and_add(&cpuc->pi_boost_cnt, 0))
+        return CPU_RT;
+#endif
 
     u32 claim_pid = __sync_fetch_and_add(&cpuc->rt_claim_pid, 0);
 
@@ -1090,6 +1108,351 @@ static struct cgrp_ctx *find_ancestor_cgrp_ctx(struct cgroup *cgrp, int level)
     return cgc;
 }
 
+#if LOCK_HINTING
+
+#define FCG_MAX_PI_EVENTS 4
+#define PI_SCAN_MAX 256
+
+struct pg_wait_event {
+    u64 lock;
+    s32 pid;
+    s32 owner_pid;
+    u32 event_info;
+    u8 is_start;
+    u8 is_acquire_event;
+    u8 type;
+    u8 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_USER_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} postgres_rb SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} pg_rb_last_drain_ns SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, FCG_MAX_PI_EVENTS);
+    __type(key, u32);
+    __type(value, u32); // cgid
+} global_pi_board SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 131072);
+    __type(key, u32);   // waiter PID
+    __type(value, u32); // owner PID
+} pi_waiter_owner_map SEC(".maps");
+
+static __always_inline void pi_convert_running_task(struct task_ctx *taskc,
+                                                    bool to_rt)
+{
+    struct cpu_ctx *cpuc;
+    u32 cpu;
+    u64 old;
+
+    if (!taskc || taskc->cur_cpu >= nr_cpus)
+        return;
+
+    cpu = taskc->cur_cpu;
+    cpuc = find_cpu_ctx(cpu);
+    if (!cpuc)
+        return;
+
+    if (to_rt) {
+        old = __sync_fetch_and_sub(&cpuc->bk_cnt, 1);
+        if (old == 0) {
+            __sync_fetch_and_add(&cpuc->bk_cnt, 1);
+            return;
+        }
+
+        __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+        __sync_fetch_and_add(&cpuc->pi_boost_cnt, 1);
+        taskc->pi_boosted_cpu = cpu;
+    } else {
+        old = __sync_fetch_and_sub(&cpuc->rt_cnt, 1);
+        if (old == 0) {
+            __sync_fetch_and_add(&cpuc->rt_cnt, 1);
+            return;
+        }
+
+        __sync_fetch_and_add(&cpuc->bk_cnt, 1);
+
+        old = __sync_fetch_and_sub(&cpuc->pi_boost_cnt, 1);
+        if (old == 0)
+            __sync_fetch_and_add(&cpuc->pi_boost_cnt, 1);
+
+        taskc->pi_boosted_cpu = nr_cpus;
+    }
+}
+
+static __always_inline void pi_boost_inc(struct task_ctx *taskc, u32 cpu, s32 pid)
+{
+    struct cpu_ctx *cpuc;
+
+    if (!taskc)
+        return;
+    if (taskc->pi_boosted_cpu == cpu)
+        return;
+
+    cpuc = find_cpu_ctx(cpu);
+    if (!cpuc)
+        return;
+
+    __sync_fetch_and_add(&cpuc->pi_boost_cnt, 1);
+    taskc->pi_boosted_cpu = cpu;
+}
+
+static __always_inline void pi_boost_dec(struct task_ctx *taskc, s32 pid)
+{
+    struct cpu_ctx *cpuc;
+    u32 cpu;
+    u64 old;
+
+    if (!taskc)
+        return;
+
+    cpu = taskc->pi_boosted_cpu;
+    if (cpu >= nr_cpus)
+        return;
+
+    cpuc = find_cpu_ctx(cpu);
+    taskc->pi_boosted_cpu = nr_cpus;
+    if (!cpuc)
+        return;
+
+    old = __sync_fetch_and_sub(&cpuc->pi_boost_cnt, 1);
+    if (old == 0) {
+        log("\tpi_boost_dec: ERROR, pi_boost_cnt underflow on cpu %u for pid %d",
+            0, cpu, pid);
+        __sync_fetch_and_add(&cpuc->pi_boost_cnt, 1);
+    }
+}
+
+static __always_inline void pi_set_task_rt(struct task_ctx *taskc, s32 pid)
+{
+    u32 old;
+
+    if (!taskc)
+        return;
+
+    old = __sync_fetch_and_add(&taskc->pi_waiter_cnt, 1);
+    if (old == 0) {
+        pi_convert_running_task(taskc, true);
+        taskc->rt_class = 1;
+        stat_inc(STAT_LOCK_HINT_BOOST);
+        log("\tpi_set_task_rt: pid %d boosted to RT", 2, pid);
+    }
+}
+
+static __always_inline void pi_clear_task_rt(struct task_ctx *taskc, s32 pid)
+{
+    u32 old;
+
+    if (!taskc)
+        return;
+
+    old = __sync_fetch_and_sub(&taskc->pi_waiter_cnt, 1);
+    if (old == 0) {
+        __sync_fetch_and_add(&taskc->pi_waiter_cnt, 1);
+        return;
+    }
+
+    if (old == 1) {
+        pi_convert_running_task(taskc, false);
+        taskc->rt_class = taskc->cgrp_rt_class;
+        log("\tpi_clear_task_rt: pid %d restored to class %u",
+            2, pid, (u32)taskc->rt_class);
+    }
+}
+
+static __always_inline void pi_finish_waiter(u32 waiter_pid)
+{
+    u32 *owner_pidp;
+    u32 owner_pid;
+    struct task_struct *owner;
+    struct task_ctx *owner_ctx;
+
+    owner_pidp = bpf_map_lookup_elem(&pi_waiter_owner_map, &waiter_pid);
+    if (!owner_pidp)
+        return;
+
+    owner_pid = *owner_pidp;
+    bpf_map_delete_elem(&pi_waiter_owner_map, &waiter_pid);
+    if (!owner_pid)
+        return;
+
+    owner = bpf_task_from_pid(owner_pid);
+    if (!owner)
+        return;
+
+    owner_ctx = bpf_task_storage_get(&task_ctx, owner, 0, 0);
+    pi_clear_task_rt(owner_ctx, owner_pid);
+    bpf_task_release(owner);
+}
+
+struct pi_exit_cleanup_ctx {
+    u32 pid;
+};
+
+static long pi_exit_cleanup_cb(void *map, void *key, void *value, void *priv)
+{
+    u32 *waiter_pid = key;
+    u32 *owner_pid = value;
+    struct pi_exit_cleanup_ctx *ctx = priv;
+
+    if (waiter_pid && owner_pid && ctx &&
+        (*waiter_pid == ctx->pid || *owner_pid == ctx->pid))
+        bpf_map_delete_elem(map, waiter_pid);
+
+    return 0;
+}
+
+static __always_inline void pi_cleanup_exiting_task(u32 pid)
+{
+    struct pi_exit_cleanup_ctx ctx = {
+        .pid = pid,
+    };
+
+    /* If the task is a waiter, release its contribution to its owner. */
+    pi_finish_waiter(pid);
+
+#pragma clang loop unroll(full)
+    for (u32 i = 0; i < FCG_MAX_PI_EVENTS; i++) {
+        u32 key = i;
+        u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+
+        if (slot && *slot == pid)
+            __sync_val_compare_and_swap(slot, pid, 0);
+    }
+
+    /* Remove any remaining waiter/owner references to this PID. */
+    bpf_for_each_map_elem(&pi_waiter_owner_map, pi_exit_cleanup_cb, &ctx, 0);
+}
+
+static long pg_rb_cb(const struct bpf_dynptr *dynptr, void *ctx)
+{
+    struct pg_wait_event ev = {};
+    struct task_struct *waiter = NULL;
+    struct task_struct *owner = NULL;
+    struct task_ctx *waiter_ctx;
+    struct task_ctx *owner_ctx;
+    long ret;
+
+    stat_inc(STAT_LOCK_HINT_MSG);
+
+    ret = bpf_dynptr_read(&ev, sizeof(ev), dynptr, 0, 0);
+    if (ret) {
+        log("pg_rb_cb: ignoring malformed sample", 2);
+        return 0;
+    }
+
+    if (ev.is_acquire_event) {
+        if (ev.is_start && ev.pid > 0)
+            pi_finish_waiter(ev.pid);
+        return 0;
+    }
+
+    if (!ev.is_start && ev.pid > 0)
+        pi_finish_waiter(ev.pid);
+
+    if (!ev.is_start || ev.owner_pid <= 0 || ev.pid <= 0)
+        return 0;
+
+    waiter = bpf_task_from_pid(ev.pid);
+    owner = bpf_task_from_pid(ev.owner_pid);
+    if (!waiter || !owner)
+        goto release;
+
+    waiter_ctx = bpf_task_storage_get(&task_ctx, waiter, 0, 0);
+    owner_ctx = bpf_task_storage_get(&task_ctx, owner, 0, 0);
+
+    /* Is an RT task waiting on a BK task? */
+    if (waiter_ctx && waiter_ctx->rt_class == 1 &&
+        owner_ctx && owner_ctx->rt_class == 0) {
+        u32 waiter_pid = ev.pid;
+        u32 owner_pid = ev.owner_pid;
+        u32 *existing_owner;
+        bool duplicate = false;
+        s32 empty_slot = -1;
+
+        stat_inc(STAT_LOCK_HINT_CONFLICT);
+
+        existing_owner =
+            bpf_map_lookup_elem(&pi_waiter_owner_map, &waiter_pid);
+        if (!existing_owner || *existing_owner != owner_pid) {
+            if (existing_owner && *existing_owner)
+                pi_finish_waiter(waiter_pid);
+            bpf_map_update_elem(&pi_waiter_owner_map, &waiter_pid,
+                                &owner_pid, BPF_ANY);
+            pi_set_task_rt(owner_ctx, owner_pid);
+        }
+
+#pragma clang loop unroll(full)
+        for (u32 i = 0; i < FCG_MAX_PI_EVENTS; i++) {
+            u32 key = (owner_pid + i) % FCG_MAX_PI_EVENTS;
+            u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+
+            if (!slot)
+                continue;
+            if (*slot == owner_pid)
+                duplicate = true;
+            else if (*slot == 0 && empty_slot < 0)
+                empty_slot = key;
+        }
+
+        if (!duplicate && empty_slot >= 0) {
+            u32 key = empty_slot;
+            u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+
+            if (slot &&
+                __sync_val_compare_and_swap(slot, 0, owner_pid) == 0 &&
+                owner_ctx->last_cpu < nr_cpus)
+                scx_bpf_kick_cpu(owner_ctx->last_cpu, SCX_KICK_PREEMPT);
+        }
+    }
+
+release:
+    if (owner)
+        bpf_task_release(owner);
+    if (waiter)
+        bpf_task_release(waiter);
+    return 0;
+}
+
+static __always_inline void pg_rb_try_drain(void)
+{
+    u32 key = 0;
+    u64 now = bpf_ktime_get_ns();
+    u64 *lastp = bpf_map_lookup_elem(&pg_rb_last_drain_ns, &key);
+    u64 old;
+    long drained;
+
+    if (!lastp)
+        return;
+
+    old = __sync_fetch_and_add(lastp, 0);
+    if (now - old < 1000000ULL)
+        return;
+
+    if (__sync_val_compare_and_swap(lastp, old, now) != old)
+        return;
+
+    drained = bpf_user_ringbuf_drain(&postgres_rb, pg_rb_cb, NULL,
+                                     BPF_RB_NO_WAKEUP);
+    stat_inc(STAT_LOCK_HINT_DRAIN);
+    if (drained < 0)
+        stat_inc(STAT_LOCK_HINT_DRAIN_FAIL);
+}
+
+#endif /* LOCK_HINTING */
+
 static void cgrp_refresh_hweight(struct cgroup *cgrp, struct cgrp_ctx *cgc)
 {
     int level;
@@ -1693,8 +2056,14 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
     cgrp = scx_bpf_task_cgroup(p);
     cgc = find_cgrp_ctx(cgrp);
 
+#if LOCK_HINTING
+    u8 rt_class = taskc->rt_class;
+#else
+    u8 rt_class = cgc && cgc->rt_class;
+#endif
+
     // IF this is the RT class
-    if ( cgc && cgc->rt_class)
+    if (rt_class)
     {
         if ( taskc->last_cpu != nr_cpus && taskc->last_cpu != prev_cpu )
         {
@@ -1719,9 +2088,14 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
             taskc->sel_cpu = nr_cpus;
 
             bool is_behind = false;
+            bool pi_block_preempt = false;
             struct cpu_ctx *tgtc = bpf_map_lookup_elem(&cpu_ctx, &tgt);
             if (tgtc)
             {
+#if LOCK_HINTING
+                pi_block_preempt =
+                    __sync_fetch_and_add(&tgtc->pi_boost_cnt, 0) > 0;
+#endif
                 #if RT_VTIME
                 if ( !is_idle && !can_kick )
                 {
@@ -1740,7 +2114,7 @@ s32 BPF_STRUCT_OPS(select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_fla
             }
 
             u64 rt_flags = SCX_ENQ_CPU_SELECTED;
-            if ( is_idle || can_kick || is_behind )
+            if (is_idle || can_kick || (is_behind && !pi_block_preempt))
                 rt_flags = rt_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT;
 
             scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | tgt, task_slice_ns, rt_flags);
@@ -1839,7 +2213,13 @@ void BPF_STRUCT_OPS(enqueue, struct task_struct *p, u64 enq_flags)
 
     cgrp_enqueue_stat( cgrp, cgc, p->pid );
 
-    if ( cgc->rt_class )
+#if LOCK_HINTING
+    u8 rt_class = taskc->rt_class;
+#else
+    u8 rt_class = cgc->rt_class;
+#endif
+
+    if (rt_class)
     {
         const struct cpumask *allowed = (const struct cpumask *)p->cpus_ptr;
 
@@ -2140,6 +2520,12 @@ void BPF_STRUCT_OPS(running, struct task_struct *p)
 
     u64 cgid = cgrp->kn->id;
     struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+#if LOCK_HINTING
+    u8 rt_class = taskc ? taskc->rt_class : 0;
+#else
+    u8 rt_class = cgc && cgc->rt_class;
+#endif
+
     if (taskc) {
         taskc->last_cpu = cpu;
         
@@ -2147,9 +2533,15 @@ void BPF_STRUCT_OPS(running, struct task_struct *p)
         {
             taskc->cur_cpu = cpu;
 
-            cnt_inc(cpuc, cpu, p->pid, cgc ? cgc->rt_class : 0);
+            cnt_inc(cpuc, cpu, p->pid, rt_class);
             cnt_dec_pending(cpuc, cpu, p->pid, cgid);
         }
+
+#if LOCK_HINTING
+        if (taskc->pi_waiter_cnt && taskc->rt_class &&
+            !taskc->cgrp_rt_class)
+            pi_boost_inc(taskc, cpu, p->pid);
+#endif
 
         #if DEBUG
             taskc->run_start_exec_ns = p->se.sum_exec_runtime;
@@ -2160,9 +2552,13 @@ void BPF_STRUCT_OPS(running, struct task_struct *p)
 
     if (cgc) 
     {
-        if ( cgc->rt_class )
+        if (rt_class)
         {
             task_running_stat( p, taskc, cgid, cgc );
+#if LOCK_HINTING
+            if (!cgc->rt_class && p->scx.slice < task_slice_ns)
+                p->scx.slice = task_slice_ns;
+#endif
         }
         else
         {
@@ -2212,7 +2608,11 @@ void BPF_STRUCT_OPS(stopping, struct task_struct *p, bool runnable)
 
     u64 cgid = cgrp ? cgrp->kn->id : 0;
 
+#if LOCK_HINTING
+    rt_class = taskc->rt_class;
+#else
     rt_class = cgc && cgc->rt_class;
+#endif
 
     /*
     * Scale the execution time by the inverse of the weight and charge.
@@ -2240,7 +2640,7 @@ void BPF_STRUCT_OPS(stopping, struct task_struct *p, bool runnable)
 #endif
 
 #if RT_VTIME
-    if ( cpuc && cgc && cgc->rt_class )
+    if (cpuc && rt_class)
     {
         u64 v = p->scx.dsq_vtime;
         u64 cur = __sync_fetch_and_add(&cpuc->rt_vtime_now, 0);
@@ -2256,6 +2656,9 @@ void BPF_STRUCT_OPS(stopping, struct task_struct *p, bool runnable)
 		taskc->bypassed_at = 0;
 	}
 
+#if LOCK_HINTING
+    pi_boost_dec(taskc, p->pid);
+#endif
 	bpf_cgroup_release(cgrp);
 
 log_and_out:
@@ -2596,6 +2999,147 @@ void BPF_STRUCT_OPS(dispatch, s32 cpu, struct task_struct *prev)
     if (!cpuc)
         return;
 
+#if LOCK_HINTING
+    // --- MULTI-LOCK PRIORITY INVERSION BYPASS ---
+
+    pg_rb_try_drain();
+
+    log("\tdispatch: dispatch called on cpu %d", 2, cpu);
+
+#pragma clang loop unroll(full)
+    for (u32 i = 0; i < FCG_MAX_PI_EVENTS; i++) {
+        u32 key = i;
+        u32 *slot = bpf_map_lookup_elem(&global_pi_board, &key);
+
+        if (slot && *slot != 0) {
+            bool pulled = false;
+            u32 pid_to_pull = *slot;
+
+            log("\tdispatch bypass: found slot for pid %u on cpu %d",
+                2, pid_to_pull, cpu);
+
+            struct task_struct *owner_task =
+                bpf_task_from_pid(pid_to_pull);
+            if (!owner_task) {
+                log("\tdispatch bypass: dead task pointer for pid %u on cpu %d",
+                    2, pid_to_pull, cpu);
+                __sync_val_compare_and_swap(slot, pid_to_pull, 0);
+                continue;
+            }
+
+            struct task_ctx *owner_ctx =
+                bpf_task_storage_get(&task_ctx, owner_task, 0, 0);
+            if (!owner_ctx) {
+                log("\tdispatch bypass: NULL ctx for pid %u on cpu %d",
+                    2, pid_to_pull, cpu);
+                bpf_task_release(owner_task);
+                continue;
+            }
+
+            const struct cpumask *allowed =
+                (const struct cpumask *)owner_task->cpus_ptr;
+            u32 dst_cpu = cpu;
+            u64 dst_dsq = SCX_DSQ_LOCAL;
+
+            if (!bpf_cpumask_test_cpu((s32)dst_cpu, allowed)) {
+                dst_cpu = owner_ctx->last_cpu;
+                if (dst_cpu >= nr_cpus ||
+                    !bpf_cpumask_test_cpu((s32)dst_cpu, allowed)) {
+                    log("\tdispatch bypass: cpuset rejected pid %u on cpu %d (last_cpu=%u)",
+                        2, pid_to_pull, cpu, dst_cpu);
+                    bpf_task_release(owner_task);
+                    continue;
+                }
+                dst_dsq = SCX_DSQ_LOCAL_ON | dst_cpu;
+            }
+
+            struct cpu_ctx *dstc = find_cpu_ctx(dst_cpu);
+            if (!dstc) {
+                log("\tdispatch bypass: NULL cpu ctx for pid %u on dst cpu %u",
+                    2, pid_to_pull, dst_cpu);
+                bpf_task_release(owner_task);
+                continue;
+            }
+
+            u64 cgid_to_pull = owner_ctx->current_cgid;
+            char cg_name_buf[32];
+            struct cgroup *owner_cgrp =
+                bpf_cgroup_from_id(cgid_to_pull);
+            bpf_probe_read_kernel(&cg_name_buf, sizeof(cg_name_buf),
+                                  owner_cgrp && owner_cgrp->kn ?
+                                  owner_cgrp->kn->name : NULL);
+            log("\tdispatch bypass: cgroup for pid %u on cpu %d: %s",
+                2, pid_to_pull, cpu, cg_name_buf);
+            if (owner_cgrp)
+                bpf_cgroup_release(owner_cgrp);
+
+            // AFFINITY CHECK
+            struct cpuset_bits *st =
+                bpf_map_lookup_elem(&cpuset_map, &cgid_to_pull);
+            if (true || (st && st->init &&
+                         mask_test_cpu(st, dst_cpu))) {
+                struct bpf_iter_scx_dsq it;
+                struct task_struct *queued;
+                u64 src_dsq = cgid_to_pull;
+
+                if (owner_task->nr_cpus_allowed != nr_cpus)
+                    src_dsq = FALLBACK_DSQ;
+
+                bpf_iter_scx_dsq_new(&it, src_dsq, 0);
+
+                int steps = 0;
+                while ((queued = bpf_iter_scx_dsq_next(&it))) {
+                    if (++steps > PI_SCAN_MAX)
+                        break;
+
+                    log("\tdispatch bypass: iterating %u", 2, queued->pid);
+
+                    if (queued->pid == pid_to_pull) {
+                        log("\tdispatch bypass: found pid %u in cgid %llu",
+                            2, pid_to_pull, cgid_to_pull);
+
+                        if (scx_bpf_dsq_move(&it, queued, dst_dsq,
+                                             SCX_ENQ_PREEMPT)) {
+                            __sync_val_compare_and_swap(slot, pid_to_pull, 0);
+
+                            pi_boost_inc(owner_ctx, dst_cpu, pid_to_pull);
+                            cnt_inc_pending(dstc, dst_cpu);
+                            dstc->cur_bk_cgid = cgid_to_pull;
+                            dstc->cur_bk_at = now;
+                            pulled = true;
+                            stat_inc(STAT_LOCK_HINT_DISPATCH_BOOST);
+
+                            if (dst_cpu != cpu)
+                                scx_bpf_kick_cpu(dst_cpu,
+                                                 SCX_KICK_PREEMPT);
+
+                            log("\tdispatch bypass: boosted pid %u on dst cpu %u from cpu %d",
+                                2, pid_to_pull, dst_cpu, cpu);
+                            break;
+                        } else {
+                            log("\tdispatch bypass: failed to move pid %u to dst cpu %u from cpu %d",
+                                2, pid_to_pull, dst_cpu, cpu);
+                        }
+                    }
+                }
+
+                log("\tdispatch bypass: finished scanning for pid %u on cpu %d dst cpu %u (cgid %llu)",
+                    2, pid_to_pull, cpu, dst_cpu, cgid_to_pull);
+                bpf_iter_scx_dsq_destroy(&it);
+            } else {
+                log("\tdispatch bypass: affinity rejected pid %u on dst cpu %u",
+                    2, pid_to_pull, dst_cpu);
+            }
+
+            bpf_task_release(owner_task);
+            if (pulled)
+                return;
+        }
+    }
+
+    // --- END BYPASS ---
+#endif
+
     if (!cpuc->cur_bk_cgid)
         goto pick_next_cgroup;
 
@@ -2773,6 +3317,11 @@ s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
     taskc->last_cpu         = nr_cpus;
     taskc->enq_cgid         = 0;
     taskc->rt_cpu           = nr_cpus;
+#if LOCK_HINTING
+    taskc->pi_boosted_cpu   = nr_cpus;
+    taskc->pi_waiter_cnt    = 0;
+    taskc->current_cgid     = args->cgroup->kn->id;
+#endif
 #if WEIGHTED_FALLBACK_DSQ
     taskc->fallback_slice_ns = 0;
     taskc->fallback_weighted = 0;
@@ -2780,6 +3329,11 @@ s32 BPF_STRUCT_OPS(init_task, struct task_struct *p,
 
     if (!(cgc = find_cgrp_ctx(args->cgroup)))
         return -ENOENT;
+
+#if LOCK_HINTING
+    taskc->cgrp_rt_class = cgc->rt_class;
+    taskc->rt_class = cgc->rt_class;
+#endif
 
     #if DEBUG
         char cg_name_buf[32] = {};
@@ -2913,6 +3467,13 @@ void BPF_STRUCT_OPS(cgroup_move, struct task_struct *p,
     struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if ( !taskc ) return;
 
+#if LOCK_HINTING
+    taskc->cgrp_rt_class = to_cgc->rt_class;
+    if (!taskc->pi_waiter_cnt)
+        taskc->rt_class = to_cgc->rt_class;
+    taskc->current_cgid = to->kn->id;
+#endif
+
     if (to_cgc->rt_class)
     {
         taskc->rt_cpu = assign_rt_cpu(p, to, taskc, true);
@@ -2955,10 +3516,12 @@ void BPF_STRUCT_OPS(ufs_exit, struct scx_exit_info *ei)
 
 void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
-    struct cgroup *cgrp;
-    struct cgrp_ctx *cgc;
     u64 cgid = 0;
     u8 rt_class = 0;
+
+#if LOCK_HINTING
+    pi_cleanup_exiting_task((u32)p->pid);
+#endif
 
     struct task_ctx *taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
     if ( !taskc ) 
@@ -2970,6 +3533,12 @@ void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args 
     if (taskc->rt_cpu < nr_cpus)
         release_rt_cpu_assignment(p, taskc);
 
+#if LOCK_HINTING
+    rt_class = taskc->rt_class;
+    cgid = taskc->current_cgid;
+    pi_boost_dec(taskc, p->pid);
+#endif
+
     u32 cur_cpu = taskc->cur_cpu;
     if ( cur_cpu >= nr_cpus )
     {
@@ -2979,16 +3548,17 @@ void BPF_STRUCT_OPS(exit_task, struct task_struct *p, struct scx_exit_task_args 
     struct cpu_ctx *cpuc = bpf_map_lookup_elem(&cpu_ctx, &cur_cpu);
     if (!cpuc) return;
 
-    cgrp = scx_bpf_task_cgroup(p);
-    if ( cgrp )
-    {
-        cgc = find_cgrp_ctx(cgrp);
-        if ( cgc )
-        {
+#if !LOCK_HINTING
+    struct cgroup *cgrp = scx_bpf_task_cgroup(p);
+    if (cgrp) {
+        struct cgrp_ctx *cgc = find_cgrp_ctx(cgrp);
+
+        cgid = cgrp->kn->id;
+        if (cgc)
             rt_class = cgc->rt_class;
-        }
+        bpf_cgroup_release(cgrp);
     }
-    bpf_cgroup_release(cgrp);
+#endif
 
     log("\ttask_exit: task with pid %d (cgid %llu) exiting!!!", rt_class, p->pid, cgid);
 
